@@ -612,34 +612,70 @@ function getClientIp(request) {
 }
 
 // #endregion
-// #region تایید توکن Cloudflare Turnstile (ضدبات، جلوی لاگین/ثبت‌نام خودکار رو می‌گیره)
-// ---------- تایید توکن Cloudflare Turnstile (ضدبات، جلوی لاگین/ثبت‌نام خودکار رو می‌گیره) ----------
-// اگه TURNSTILE_SECRET_KEY تو تنظیمات ورکر ست نشده باشه، این چک نادیده گرفته می‌شه (برای اینکه در حین توسعه سایت قفل نشه)
-async function verifyTurnstile(token, request, env) {
-  if (!env.TURNSTILE_SECRET_KEY) return true;
-  if (!token) return false;
+// #region کپچای اثبات‌کار خودمیزبان (ضدبات، جایگزینِ Turnstile — بدون تماس با هیچ سرور خارجی)
+// ---------- کپچای اثبات‌کار خودمیزبان (ضدبات، جایگزینِ Turnstile — بدون تماس با هیچ سرور خارجی) ----------
+// چرا؟ Turnstile برای خیلی از کاربرهای ایرانی یا لود نمی‌شه یا کند/ناپایداره چون باید با سرورهای
+// کلادفلر (challenges.cloudflare.com) تماس بگیره. این جایگزین کاملاً روی همین ورکر اجرا می‌شه:
+// نه مرورگر کاربر و نه خودِ ورکر هیچ درخواستی به سرور خارجی نمی‌زنن. مکانیزم شبیه Altcha است:
+// یه «چالش» اثبات‌کار (proof-of-work) به کلاینت داده می‌شه، کاربر (بدون هیچ تعامل دستی جز یه
+// تیک) با هش کردن SHA-256 دنبال یه nonce می‌گرده که هشِ salt+nonce با تعداد مشخصی صفر شروع بشه،
+// و سرور در پایان همون محاسبه رو تکرار و تایید می‌کنه. سختیِ پایین (DIFFICULTY_BITS) باعث می‌شه
+// حل‌کردنش رو مرورگر کاربر واقعی زیر یه ثانیه طول بکشه، ولی جلوی اسکریپت‌های خودکارِ ساده رو بگیره.
+const CAPTCHA_DIFFICULTY_BITS = 18; // هرچی بیشتر، سخت‌تر و کندتر (برای مرورگر معمولی خوب: ۱۶ تا ۲۰)
+const CAPTCHA_TTL_SECONDS = 120; // مهلت حل کردنِ هر چالش
 
-  try {
-    const body = new URLSearchParams();
-    body.append("secret", env.TURNSTILE_SECRET_KEY);
-    body.append("response", token);
-    body.append("remoteip", getClientIp(request));
-
-    const res = await fetch("https://challenges.cloudflare.com/turnstile/v0/siteverify", {
-      method: "POST",
-      headers: { "Content-Type": "application/x-www-form-urlencoded" },
-      body,
-    });
-    const data = await res.json();
-    return !!data.success;
-  } catch (e) {
-    return false;
-  }
+function randomBase64Url(bytes = 24) {
+  const arr = crypto.getRandomValues(new Uint8Array(bytes));
+  let bin = "";
+  for (const b of arr) bin += String.fromCharCode(b);
+  return btoa(bin).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/g, "");
 }
 
-// اپ نیتیوِ اندروید نمی‌تونه ویجتِ وبیِ Turnstile رو نشون بده؛ به‌جاش یه کلید مخفی تو خودِ اپ ذخیره می‌شه
+async function sha256Hex(text) {
+  const buf = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(text));
+  return bufferToHex(buf);
+}
+
+// تعداد بیتِ صفرِ ابتدای هش (به‌صورت باینری) رو می‌شمره؛ برای چک کردنِ سختیِ جواب
+function leadingZeroBits(hexHash) {
+  let bits = 0;
+  for (const ch of hexHash) {
+    const nibble = parseInt(ch, 16);
+    if (nibble === 0) { bits += 4; continue; }
+    // شمارشِ صفرهای ابتدایی همون نیبل ۴بیتی
+    bits += Math.clz32(nibble) - 28;
+    break;
+  }
+  return bits;
+}
+
+// چالش جدید می‌سازه و توی جدولِ kv_store (روی D1، نه سرویسِ خارجی) ذخیره‌اش می‌کنه
+async function createCaptchaChallenge(env) {
+  const id = randomBase64Url(16);
+  const salt = randomBase64Url(16);
+  await kvPut(env, `captcha:${id}`, JSON.stringify({ salt, used: false }), CAPTCHA_TTL_SECONDS);
+  return { id, salt, difficulty: CAPTCHA_DIFFICULTY_BITS };
+}
+
+// جوابِ کلاینت (id چالش + nonce پیدا شده) رو تایید می‌کنه؛ هر چالش فقط یک‌بار قابلِ استفاده‌ست
+async function verifyCaptchaSolution(solution, env) {
+  if (!solution || !solution.id || solution.nonce === undefined || solution.nonce === null) return false;
+  const raw = await kvGet(env, `captcha:${solution.id}`);
+  if (!raw) return false; // چالش وجود نداره یا منقضی شده
+  const state = JSON.parse(raw);
+  if (state.used) return false;
+
+  const hash = await sha256Hex(`${state.salt}:${solution.nonce}`);
+  if (leadingZeroBits(hash) < CAPTCHA_DIFFICULTY_BITS) return false;
+
+  // یک‌بارمصرف: بلافاصله بعد از تایید موفق، چالش رو باطل کن تا قابلِ استفاده‌ی مجدد نباشه
+  await kvDelete(env, `captcha:${solution.id}`);
+  return true;
+}
+
+// اپ نیتیوِ اندروید نمی‌تونه ویجتِ وبیِ کپچا رو نشون بده؛ به‌جاش یه کلید مخفی تو خودِ اپ ذخیره می‌شه
 // و با هدر X-App-Secret فرستاده می‌شه. اگه این هدر با مقدار محرمانه‌ی env مطابقت داشت، یعنی درخواست
-// از اپ رسمیه و از چکِ Turnstile معاف می‌شه (بقیه‌ی محدودیت‌های نرخ درخواست همچنان برقرارن).
+// از اپ رسمیه و از چکِ کپچا معاف می‌شه (بقیه‌ی محدودیت‌های نرخ درخواست همچنان برقرارن).
 function isTrustedNativeApp(request, env) {
   if (!env.APP_SHARED_SECRET) return false;
   const header = request.headers.get("X-App-Secret") || "";
@@ -751,6 +787,19 @@ async function handleLogout(request, env) {
 const USERNAME_RE = /^[\p{L}\p{N}_]{3,20}$/u;
 
 // #endregion
+// #region صدور چالشِ کپچا (اثبات‌کار) برای فرم‌های ورود/ثبت‌نام
+// ---------- صدور چالشِ کپچا (اثبات‌کار) برای فرم‌های ورود/ثبت‌نام ----------
+async function handleCaptchaChallenge(request, env) {
+  const ip = getClientIp(request);
+  // یه محدودیتِ سبک روی صدورِ چالش، تا کسی نتونه با هزاران درخواستِ پشت‌سرهم جدولِ kv_store رو پر کنه
+  if (!(await checkRateLimit(env, "captcha_challenge", ip, 60, 300))) {
+    return json({ error: "درخواست زیاد بود، کمی صبر کن" }, 429);
+  }
+  const challenge = await createCaptchaChallenge(env);
+  return json(challenge);
+}
+
+// #endregion
 // #region ثبت‌نام
 // ---------- ثبت‌نام ----------
 async function handleRegister(request, env) {
@@ -759,9 +808,9 @@ async function handleRegister(request, env) {
     return json({ error: "تعداد ثبت‌نام از این آی‌پی زیاد بوده، یه ساعت دیگه امتحان کن" }, 429);
   }
 
-  const { username, password, turnstileToken, referralCode } = await request.json();
+  const { username, password, captchaSolution, referralCode } = await request.json();
 
-  if (!isTrustedNativeApp(request, env) && !(await verifyTurnstile(turnstileToken, request, env))) {
+  if (!isTrustedNativeApp(request, env) && !(await verifyCaptchaSolution(captchaSolution, env))) {
     return json({ error: "تایید امنیتی انجام نشد؛ صفحه رو رفرش کن و دوباره امتحان کن" }, 400);
   }
 
@@ -871,10 +920,10 @@ async function handleLogin(request, env) {
     return json({ error: "تعداد تلاش‌های ورود از این آی‌پی زیاد بوده، چند دقیقه دیگه امتحان کن" }, 429);
   }
 
-  const { username, password, turnstileToken } = await request.json();
+  const { username, password, captchaSolution } = await request.json();
   if (!username || !password) return json({ error: "نام کاربری و رمز لازمه" }, 400);
 
-  if (!isTrustedNativeApp(request, env) && !(await verifyTurnstile(turnstileToken, request, env))) {
+  if (!isTrustedNativeApp(request, env) && !(await verifyCaptchaSolution(captchaSolution, env))) {
     return json({ error: "تایید امنیتی انجام نشد؛ صفحه رو رفرش کن و دوباره امتحان کن" }, 400);
   }
 
@@ -5364,6 +5413,9 @@ async function handleChangePassword(request, env) {
 // #region تشخیص مسیر و صدا زدن هندلر مربوطه (بدون هدر CORS؛ CORS در fetch اصلی اضافه می‌شه)
 // ---------- تشخیص مسیر و صدا زدن هندلر مربوطه (بدون هدر CORS؛ CORS در fetch اصلی اضافه می‌شه) ----------
 async function routeRequest(url, request, env, ctx) {
+      if (url.pathname === "/api/captcha/challenge" && request.method === "POST") {
+        return await handleCaptchaChallenge(request, env);
+      }
       if (url.pathname === "/api/register" && request.method === "POST") {
         return await handleRegister(request, env);
       }
