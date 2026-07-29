@@ -734,18 +734,24 @@ async function getUserFromToken(request, env) {
   const token = auth.startsWith("Bearer ") ? auth.slice(7) : null;
   if (!token) return null;
 
-  const session = await env.D1.prepare("SELECT username, expires_at FROM sessions WHERE token = ?").bind(token).first();
-  if (!session) return null;
-  if (session.expires_at < Date.now()) {
+  // قبلاً این تابع دو تا کوئریِ پشتِ‌سرِهم به D1 می‌زد (یکی برای sessions، یکی برای users)؛ چون این
+  // تابع رویِ تقریباً هر اندپوینتِ لاگین‌شده صدا زده می‌شه، این دو رفت‌وبرگشت رو با یه JOIN به یکی
+  // تبدیل کردیم — همینه که سرعتِ تقریباً کل سایت رو (نه فقط این تابع) قابل‌لمس بهتر می‌کنه.
+  const row = await env.D1.prepare(
+    "SELECT sessions.expires_at AS expires_at, users.username AS username, users.banned AS banned " +
+    "FROM sessions JOIN users ON users.username = sessions.username " +
+    "WHERE sessions.token = ?"
+  ).bind(token).first();
+
+  if (!row) return null;
+  if (row.expires_at < Date.now()) {
     // سشن منقضی شده؛ پاکش می‌کنیم و رد می‌کنیم
     await env.D1.prepare("DELETE FROM sessions WHERE token = ?").bind(token).run();
     return null;
   }
+  if (row.banned) return null;
 
-  const user = await env.D1.prepare("SELECT banned FROM users WHERE username = ?").bind(session.username).first();
-  if (!user || user.banned) return null;
-
-  return session.username;
+  return row.username;
 }
 
 // مثل getUserFromToken، ولی علاوه بر هدر Authorization، از پارامتر ?token= هم پشتیبانی می‌کنه؛
@@ -1344,6 +1350,90 @@ async function handlePost(request, env) {
 // #endregion
 // #region پروکسی گرفتن فایل از تلگرام (بدون افشای توکن)
 // ---------- پروکسی گرفتن فایل از تلگرام (بدون افشای توکن) ----------
+// #endregion
+// #region مدیای اسپلشِ صفحه‌ی لاگین (ویدیو/آهنگِ درِ ورودی) — پروکسی و کش‌شده روی خودِ ورکر
+// ---------- مدیای اسپلشِ صفحه‌ی لاگین (ویدیو/آهنگِ درِ ورودی) ----------
+// چرا؟ قبلاً مرورگرِ کاربر مستقیم به api.github.com و jsDelivr/raw.githubusercontent.com وصل
+// می‌شد؛ این‌ها دامنه‌های خارجی‌ان و ممکنه از ایران کند/ناپایدار باشن. الان مرورگر فقط با دامنه‌ی
+// خودمون حرف می‌زنه: خودِ ورکر (که از شبکه‌ی داخلیِ کلادفلر به گیت‌هاب وصل می‌شه، نه از ایران)
+// لیست و فایل‌ها رو می‌گیره و رو edge کش می‌کنه. این صفحه قبل از لاگینه، پس این دو اندپوینت عمداً
+// بدون نیاز به توکن کار می‌کنن (محتوای عمومی/تزئینیه، نه دیتای کاربر).
+const SPLASH_MEDIA_REPO = "oldvasl/vasl";
+const SPLASH_MEDIA_BRANCH = "main";
+const SPLASH_MEDIA_FOLDER = "login";
+
+async function handleSplashMediaList(env, ctx) {
+  const cache = caches.default;
+  const cacheKey = new Request("https://splash-media-list.internal/list", { method: "GET" });
+  const cached = await cache.match(cacheKey);
+  if (cached) return cached;
+
+  const apiUrl = `https://api.github.com/repos/${SPLASH_MEDIA_REPO}/contents/${SPLASH_MEDIA_FOLDER}?ref=${SPLASH_MEDIA_BRANCH}`;
+  const res = await fetch(apiUrl, { headers: { "User-Agent": "dehaat-worker", Accept: "application/vnd.github+json" } });
+  if (!res.ok) return json({ error: "لیست فایل‌های اسپلش گرفته نشد" }, 502);
+  const files = await res.json();
+
+  const videos = (Array.isArray(files) ? files : [])
+    .filter((f) => f.type === "file" && /^[\w.\-]+\.mp4$/i.test(f.name))
+    .map((f) => f.name);
+  const audios = (Array.isArray(files) ? files : [])
+    .filter((f) => f.type === "file" && /^[\w.\-]+\.mp3$/i.test(f.name))
+    .map((f) => f.name);
+
+  // کشِ ۱۰دقیقه‌ای رو edge؛ هم لیمیتِ نرخِ API گیت‌هاب اذیت نمی‌شه، هم فایلِ تازه‌آپلودشده خیلی دیر ظاهر نمی‌شه
+  const response = json({ videos, audios });
+  response.headers.set("Cache-Control", "public, max-age=600");
+  if (ctx) ctx.waitUntil(cache.put(cacheKey, response.clone()));
+  return response;
+}
+
+async function handleSplashMediaFile(name, request, env, ctx) {
+  // فقط اسمِ فایلِ ساده (بدون اسلش/دات‌دات) و فقط پسوندِ mp4/mp3 قبول می‌شه — جلوی path traversal رو می‌گیره
+  if (!name || !/^[\w.\-]+\.(mp4|mp3)$/i.test(name) || name.includes("..") || name.includes("/")) {
+    return json({ error: "نام فایل نامعتبره" }, 400);
+  }
+
+  const rangeHeader = request ? request.headers.get("Range") : null;
+  const cache = caches.default;
+  const cacheKey = new Request(`https://splash-media-file.internal/${encodeURIComponent(name)}`, { method: "GET" });
+
+  // مثل handleMedia: فقط جواب‌های کامل (بدون Range) کش می‌شن؛ Range (سیک‌کردنِ ویدیو/صدا) همیشه زنده گرفته می‌شه
+  if (!rangeHeader) {
+    const cached = await cache.match(cacheKey);
+    if (cached) return cached;
+  }
+
+  const sourceUrl = `https://raw.githubusercontent.com/${SPLASH_MEDIA_REPO}/${SPLASH_MEDIA_BRANCH}/${SPLASH_MEDIA_FOLDER}/${encodeURIComponent(name)}`;
+  const sourceHeaders = {};
+  if (rangeHeader) sourceHeaders["Range"] = rangeHeader;
+
+  const fileRes = await fetch(sourceUrl, { headers: sourceHeaders });
+  if (!fileRes.ok && fileRes.status !== 206) return json({ error: "فایل پیدا نشد" }, 404);
+
+  const headers = new Headers();
+  headers.set(
+    "Content-Type",
+    fileRes.headers.get("Content-Type") || (/\.mp3$/i.test(name) ? "audio/mpeg" : "video/mp4")
+  );
+  headers.set("X-Content-Type-Options", "nosniff");
+  headers.set("Cache-Control", "public, max-age=86400");
+  headers.set("Accept-Ranges", "bytes");
+  const contentLength = fileRes.headers.get("Content-Length");
+  if (contentLength) headers.set("Content-Length", contentLength);
+  const contentRange = fileRes.headers.get("Content-Range");
+  if (contentRange) headers.set("Content-Range", contentRange);
+
+  const status = rangeHeader && fileRes.status === 206 ? 206 : 200;
+  const response = new Response(fileRes.body, { status, headers });
+
+  if (!rangeHeader && status === 200 && ctx) {
+    ctx.waitUntil(cache.put(cacheKey, response.clone()));
+  }
+  return response;
+}
+
+// #endregion
+// #region مدیای تلگرام (عکس/ویدیو/صدای پست‌ها و پیام‌ها) — پروکسی و کش‌شده روی خودِ ورکر
 async function handleMedia(fileId, env, request, ctx) {
   if (!fileId) return json({ error: "شناسه فایل لازمه" }, 400);
 
@@ -2038,7 +2128,7 @@ async function createNotification(env, toUsername, data) {
 // #endregion
 // #region ثبت کامنت جدید (متنی یا استیکری)
 // ---------- ثبت کامنت جدید (متنی یا استیکری) ----------
-async function handleAddComment(request, env) {
+async function handleAddComment(request, env, ctx) {
   const username = await getUserFromToken(request, env);
   if (!username) return json({ error: "ابتدا وارد شو" }, 401);
   if (!(await checkRateLimit(env, "comment", username, 20, 300))) {
@@ -2148,10 +2238,13 @@ async function handleAddComment(request, env) {
 
   const notifSnippet = type === "sticker" ? "🖼️ یک استیکر فرستاد" : text.slice(0, 120);
 
+  // ساختِ اعلان (INSERT + فراخوانیِ Web Push به سرورهای خارجی) دیگه جلوی جوابِ ثبتِ کامنت رو
+  // نمی‌گیره؛ با ctx.waitUntil در پس‌زمینه انجام می‌شه تا کاربر بلافاصله بعد از فرستادنِ کامنت جواب بگیره.
+  let notifyPromise = null;
   if (parentComment) {
     // ریپلای: اعلان برای صاحب کامنت مادر (نه لزوماً صاحب پست)
     if (parentComment.username && parentComment.username !== username) {
-      await createNotification(env, parentComment.username, {
+      notifyPromise = createNotification(env, parentComment.username, {
         type: "reply",
         post_id,
         from_username: username,
@@ -2161,13 +2254,17 @@ async function handleAddComment(request, env) {
     }
   } else if (post && post.username && post.username !== username) {
     // کامنت معمولی: اعلان برای صاحب پست
-    await createNotification(env, post.username, {
+    notifyPromise = createNotification(env, post.username, {
       type: "comment",
       post_id,
       from_username: username,
       text: notifSnippet,
       comment_id: id,
     });
+  }
+  if (notifyPromise) {
+    if (ctx) ctx.waitUntil(notifyPromise);
+    else await notifyPromise;
   }
 
   return json({ ok: true, comment });
@@ -2467,52 +2564,72 @@ async function fetchFeedPage(env, viewerUsername, opts) {
   }
   const whereSql = where.length ? `WHERE ${where.join(" AND ")}` : "";
 
-  const totalRow = await bind(env.D1.prepare(`SELECT COUNT(*) as c FROM posts ${whereSql}`), params).first();
-  const total = totalRow ? totalRow.c : 0;
-
-  const start = (page - 1) * pageSize;
-  const pagePosts = (
-    await bind(
+  // قبلاً «تعداد کل» و «خودِ پست‌ها» دو تا کوئریِ جدا و پشتِ‌سرِهم بودن؛ چون هیچ‌کدوم به نتیجه‌ی
+  // اون‌یکی نیاز نداره، با D1.batch تو یه رفت‌وبرگشتِ واحد به دیتابیس اجرا می‌شن.
+  const [totalBatchResult, pagePostsBatchResult] = await env.D1.batch([
+    bind(env.D1.prepare(`SELECT COUNT(*) as c FROM posts ${whereSql}`), params),
+    bind(
       env.D1.prepare(`SELECT * FROM posts ${whereSql} ORDER BY ${orderBySql} LIMIT ? OFFSET ?`),
-      [...params, pageSize, start]
-    ).all()
-  ).results || [];
+      [...params, pageSize, (page - 1) * pageSize]
+    ),
+  ]);
+  const total = (totalBatchResult.results && totalBatchResult.results[0] && totalBatchResult.results[0].c) || 0;
+  const pagePosts = pagePostsBatchResult.results || [];
+  const start = (page - 1) * pageSize;
 
+  // چهار تا کوئریِ بعدی (آواتارها، رای‌های خودِ کاربر، لایک‌های خودِ کاربر، تعدادِ کامنت‌ها) هیچ‌کدوم
+  // به نتیجه‌ی اون‌یکی وابسته نیست، فقط به idهای همین صفحه؛ به‌جایِ صبرکردنِ پشتِ‌سرِهم برای هرکدوم
+  // (یا حتی Promise.all که بازم چند رفت‌وبرگشتِ جدا به D1 می‌زنه)، همه رو با یه D1.batch واحد
+  // می‌فرستیم — یعنی کل فیدِ یه صفحه با فقط ۲ رفت‌وبرگشتِ D1 آماده می‌شه، نه ۵-۶ تا.
   const uniqueUsernames = [...new Set(pagePosts.map((p) => p.username))];
+  const postIds = pagePosts.map((p) => p.id);
+
   const avatarMap = {};
-  if (uniqueUsernames.length > 0) {
-    const placeholders = uniqueUsernames.map(() => "?").join(",");
-    const profileRows = await bind(
-      env.D1.prepare(`SELECT username, avatar_file_id FROM profiles WHERE username IN (${placeholders})`),
-      uniqueUsernames
-    ).all();
-    for (const row of profileRows.results || []) {
-      if (row.avatar_file_id) avatarMap[row.username] = row.avatar_file_id;
-    }
-  }
-
-  let voteMap = {};
-  let likeMap = {};
-  if (viewerUsername && pagePosts.length > 0) {
-    const ids = pagePosts.map((p) => p.id);
-    const placeholders = ids.map(() => "?").join(",");
-    const [voteRows, likeRows] = await Promise.all([
-      bind(env.D1.prepare(`SELECT post_id, action FROM votes WHERE username = ? AND post_id IN (${placeholders})`), [viewerUsername, ...ids]).all(),
-      bind(env.D1.prepare(`SELECT post_id FROM likes WHERE username = ? AND post_id IN (${placeholders})`), [viewerUsername, ...ids]).all(),
-    ]);
-    for (const row of voteRows.results || []) voteMap[row.post_id] = row.action;
-    for (const row of likeRows.results || []) likeMap[row.post_id] = true;
-  }
-
+  const voteMap = {};
+  const likeMap = {};
   const commentCountMap = {};
+
   if (pagePosts.length > 0) {
-    const ids = pagePosts.map((p) => p.id);
-    const placeholders = ids.map(() => "?").join(",");
-    const countRows = await bind(
-      env.D1.prepare(`SELECT post_id, COUNT(*) as c FROM comments WHERE post_id IN (${placeholders}) GROUP BY post_id`),
-      ids
-    ).all();
-    for (const row of countRows.results || []) commentCountMap[row.post_id] = row.c;
+    const avatarPlaceholders = uniqueUsernames.map(() => "?").join(",");
+    const idPlaceholders = postIds.map(() => "?").join(",");
+
+    const batchStmts = [
+      uniqueUsernames.length > 0
+        ? bind(env.D1.prepare(`SELECT username, avatar_file_id FROM profiles WHERE username IN (${avatarPlaceholders})`), uniqueUsernames)
+        : null,
+      viewerUsername
+        ? bind(env.D1.prepare(`SELECT post_id, action FROM votes WHERE username = ? AND post_id IN (${idPlaceholders})`), [viewerUsername, ...postIds])
+        : null,
+      viewerUsername
+        ? bind(env.D1.prepare(`SELECT post_id FROM likes WHERE username = ? AND post_id IN (${idPlaceholders})`), [viewerUsername, ...postIds])
+        : null,
+      bind(env.D1.prepare(`SELECT post_id, COUNT(*) as c FROM comments WHERE post_id IN (${idPlaceholders}) GROUP BY post_id`), postIds),
+    ];
+    // اسلات‌های null (وقتی مثلاً کاربر مهمونه و رای/لایک معنی نداره) رو از batch حذف می‌کنیم، ولی
+    // اندیسشون رو نگه می‌داریم تا بعداً بدونیم کدوم نتیجه مالِ کدوم کوئریه
+    const activeIndexes = [];
+    const activeStmts = [];
+    batchStmts.forEach((stmt, i) => {
+      if (stmt) { activeIndexes.push(i); activeStmts.push(stmt); }
+    });
+    const results = activeStmts.length > 0 ? await env.D1.batch(activeStmts) : [];
+    const resultByIndex = {};
+    activeIndexes.forEach((originalIndex, i) => { resultByIndex[originalIndex] = results[i]; });
+
+    if (resultByIndex[0]) {
+      for (const row of resultByIndex[0].results || []) {
+        if (row.avatar_file_id) avatarMap[row.username] = row.avatar_file_id;
+      }
+    }
+    if (resultByIndex[1]) {
+      for (const row of resultByIndex[1].results || []) voteMap[row.post_id] = row.action;
+    }
+    if (resultByIndex[2]) {
+      for (const row of resultByIndex[2].results || []) likeMap[row.post_id] = true;
+    }
+    if (resultByIndex[3]) {
+      for (const row of resultByIndex[3].results || []) commentCountMap[row.post_id] = row.c;
+    }
   }
 
   const enrichedPosts = pagePosts.map((p) => ({
@@ -2592,7 +2709,7 @@ async function handleMarkDeelsSeen(request, env) {
 // #endregion
 // #region رای دادن به پست (آپ‌ووت/داون‌ووت)
 // ---------- رای دادن به پست (آپ‌ووت/داون‌ووت) ----------
-async function handleVote(request, env) {
+async function handleVote(request, env, ctx) {
   const username = await getUserFromToken(request, env);
   if (!username) return json({ error: "ابتدا وارد شو" }, 401);
 
@@ -2608,11 +2725,16 @@ async function handleVote(request, env) {
   if (!postId) return json({ error: "شناسه پست لازمه" }, 400);
   if (!["up", "down"].includes(action)) return json({ error: "نوع رای نامعتبره" }, 400);
 
-  const post = await env.D1.prepare("SELECT username FROM posts WHERE id = ?").bind(postId).first();
-  if (!post) return json({ error: "پست پیدا نشد" }, 404);
-
-  const existingRow = await env.D1.prepare("SELECT action FROM votes WHERE post_id = ? AND username = ?").bind(postId, username).first();
-  const existing = existingRow ? existingRow.action : null;
+  // قبلاً «مالکِ پست» و «رایِ قبلیِ همین کاربر» دو تا کوئریِ جدا و پشتِ‌سرِهم بودن؛ چون به هم وابسته
+  // نیستن، با یه LEFT JOIN تو یه رفت‌وبرگشتِ واحد می‌گیریمشون.
+  const info = await env.D1.prepare(
+    "SELECT posts.username AS post_owner, votes.action AS existing_action " +
+    "FROM posts LEFT JOIN votes ON votes.post_id = posts.id AND votes.username = ? " +
+    "WHERE posts.id = ?"
+  ).bind(username, postId).first();
+  if (!info) return json({ error: "پست پیدا نشد" }, 404);
+  const post = { username: info.post_owner };
+  const existing = info.existing_action || null;
 
   // به‌جای خوندنِ upvotes/downvotes و نوشتنِ دوباره‌شون (که زیر بار همزمان می‌تونه یه رای رو گم کنه)،
   // مستقیم با `col = col ± 1` توی خودِ SQL افزایش/کاهش می‌دیم؛ این عملیات توی SQLite/D1 اتمیکه.
@@ -2642,13 +2764,17 @@ async function handleVote(request, env) {
   const upvotes = finalRow.upvotes || 0;
   const downvotes = finalRow.downvotes || 0;
 
-  // اعلان فقط برای آپ‌ووت جدید (نه لغو رای، نه داون‌ووت) و نه به خود صاحب پست
+  // اعلان فقط برای آپ‌ووت جدید (نه لغو رای، نه داون‌ووت) و نه به خود صاحب پست. ساختِ اعلان (که خودش
+  // هم یه INSERT دیگه‌ست هم یه فراخوانیِ Web Push به سرورهای خارجی) دیگه جلوی جوابِ رای رو نمی‌گیره؛
+  // با ctx.waitUntil در پس‌زمینه انجام می‌شه، پس کاربر بلافاصله بعد از رای‌دادن جواب می‌گیره.
   if (userVote === "up" && existing !== "up" && post.username && post.username !== username) {
-    await createNotification(env, post.username, {
+    const notifyPromise = createNotification(env, post.username, {
       type: "vote",
       post_id: postId,
       from_username: username,
     });
+    if (ctx) ctx.waitUntil(notifyPromise);
+    else await notifyPromise;
   }
 
   return json({
@@ -2677,10 +2803,14 @@ async function handleLike(request, env) {
   const postId = (body.post_id || "").toString();
   if (!postId) return json({ error: "شناسه پست لازمه" }, 400);
 
-  const post = await env.D1.prepare("SELECT username FROM posts WHERE id = ?").bind(postId).first();
-  if (!post) return json({ error: "پست پیدا نشد" }, 404);
-
-  const existing = await env.D1.prepare("SELECT 1 FROM likes WHERE post_id = ? AND username = ?").bind(postId, username).first();
+  // مثلِ رای‌دهی: «پست وجود داره؟» و «کاربر قبلاً لایک کرده؟» با یه LEFT JOIN تو یه رفت‌وبرگشت
+  const info = await env.D1.prepare(
+    "SELECT posts.id AS post_id, likes.post_id AS like_row " +
+    "FROM posts LEFT JOIN likes ON likes.post_id = posts.id AND likes.username = ? " +
+    "WHERE posts.id = ?"
+  ).bind(username, postId).first();
+  if (!info) return json({ error: "پست پیدا نشد" }, 404);
+  const existing = !!info.like_row;
 
   // مثل رای‌دهی، اینجا هم `likes = likes ± 1` مستقیم توی SQL انجام می‌شه (اتمیک) به‌جای خوندن-سپس-نوشتن
   let liked;
@@ -5441,7 +5571,7 @@ async function routeRequest(url, request, env, ctx) {
         return await handleDeletePost(request, env);
       }
       if (url.pathname === "/api/comment" && request.method === "POST") {
-        return await handleAddComment(request, env);
+        return await handleAddComment(request, env, ctx);
       }
       if (url.pathname === "/api/comment" && request.method === "DELETE") {
         return await handleDeleteComment(request, env);
@@ -5469,7 +5599,7 @@ async function routeRequest(url, request, env, ctx) {
         return await handleDeleteSticker(request, env);
       }
       if (url.pathname === "/api/vote" && request.method === "POST") {
-        return await handleVote(request, env);
+        return await handleVote(request, env, ctx);
       }
       if (url.pathname === "/api/like" && request.method === "POST") {
         return await handleLike(request, env);
@@ -5572,6 +5702,13 @@ async function routeRequest(url, request, env, ctx) {
       }
       if (url.pathname === "/api/fcm/delete-token" && request.method === "POST") {
         return await handleDeleteFcmToken(request, env);
+      }
+      if (url.pathname === "/api/splash-media/list" && request.method === "GET") {
+        return await handleSplashMediaList(env, ctx);
+      }
+      if (url.pathname.startsWith("/api/splash-media/file/") && request.method === "GET") {
+        const name = decodeURIComponent(url.pathname.slice("/api/splash-media/file/".length));
+        return await handleSplashMediaFile(name, request, env, ctx);
       }
       if (url.pathname.startsWith("/api/media/") && request.method === "GET") {
         const fileId = decodeURIComponent(url.pathname.slice("/api/media/".length));
