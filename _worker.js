@@ -854,15 +854,46 @@ async function handleRegister(request, env) {
   const now = Date.now();
   await bind(
     env.D1.prepare(
-      "INSERT INTO users (username, salt, hash, banned, is_admin, created_at, referred_by, referred_code, referral_confirmed) VALUES (?, ?, ?, 0, 0, ?, ?, ?, 0)"
+      "INSERT INTO users (username, salt, hash, banned, is_admin, created_at, referred_by) VALUES (?, ?, ?, 0, 0, ?, ?)"
     ),
-    [username, salt, hash, now, referralRow.owner_username, normalizedReferralCode]
+    [username, salt, hash, now, referralRow.owner_username]
   ).run();
 
-  // نکته‌ی مهم: کد معرف اینجا هنوز مصرف/باطل نمی‌شه (use_count، used، referral_code_uses، کول‌داونِ
-  // معرف‌کننده و صدورِ کدِ جدید براش دست‌نخورده می‌مونن). این‌ها فقط موقعِ اولین ورودِ موفقِ همین کاربرِ
-  // تازه‌ثبت‌نام‌شده (توی handleLogin، با finalizeReferralUse) انجام می‌شن؛ یعنی تا وقتی خودِ کاربر
-  // واقعاً وارد سایت نشده، کد معرف برای هیچ‌کس باطل نمی‌شه.
+  // آمارِ مصرفِ کد معرف رو به‌روز کن؛ فقط وقتی به سقفِ max_uses برسه به‌عنوانِ «تمام‌شده» علامت می‌خوره
+  const newUseCount = useCount + 1;
+  const exhausted = newUseCount >= maxUses ? 1 : 0;
+  await env.D1.prepare(
+    "UPDATE referral_codes SET used = ?, use_count = ?, used_by = ?, used_at = ? WHERE code = ?"
+  ).bind(exhausted, newUseCount, username, now, normalizedReferralCode).run();
+  // ردِ هر بارِ استفاده (برای کدهای چندبارمصرف، تا Aghey بتونه لیستِ کاملِ استفاده‌کننده‌ها رو ببینه)
+  await env.D1.prepare(
+    "INSERT INTO referral_code_uses (id, code, used_by, used_at) VALUES (?, ?, ?, ?)"
+  ).bind(`${now}_${randomHex(4)}`, normalizedReferralCode, username, now).run();
+
+  const ownerUsername = referralRow.owner_username;
+  if (referralRow.is_custom) {
+    // کدهای شخصی‌سازی‌شده مستقل از سیستمِ کول‌داون/کدِ خودکارِ شخصیِ صاحبشون هستن؛ چیزِ دیگه‌ای لازم نیست
+  } else if (isSuperAdmin(ownerUsername)) {
+    // مالک سایت محدودیت و کول‌داون نداره؛ همیشه یه کدِ فعالِ جدید داشته باشه
+    await issueNewReferralCode(env, ownerUsername);
+  } else {
+    const ownerRow = await env.D1.prepare(
+      "SELECT referral_success_count FROM users WHERE username = ?"
+    ).bind(ownerUsername).first();
+    const newCount = ((ownerRow && ownerRow.referral_success_count) || 0) + 1;
+    let cooldownUntil = null;
+    if (newCount % REFERRAL_SUCCESS_BATCH === 0) {
+      cooldownUntil = now + REFERRAL_COOLDOWN_MS;
+    }
+    await env.D1.prepare(
+      "UPDATE users SET referral_success_count = ?, referral_cooldown_until = ? WHERE username = ?"
+    ).bind(newCount, cooldownUntil, ownerUsername).run();
+
+    if (!cooldownUntil) {
+      // هنوز به سقفِ ۵‌تایی نرسیده؛ بلافاصله یه کدِ جدید براش بساز
+      await issueNewReferralCode(env, ownerUsername);
+    }
+  }
 
   return json({ ok: true });
 }
@@ -922,12 +953,6 @@ async function handleLogin(request, env) {
   if (userData.banned) return json({ error: "این حساب توسط مدیر سایت مسدود شده" }, 403);
 
   await kvDelete(env, `login_fails:${username}`);
-
-  // اولین ورودِ موفقِ کاربری که با کد معرف ثبت‌نام کرده = لحظه‌ی «واقعاً واردِ سایت شدن»؛
-  // دقیقاً همین‌جا (نه موقعِ خودِ ثبت‌نام) کد معرف واقعاً مصرف/باطل می‌شه
-  if (userData.referred_code && !userData.referral_confirmed) {
-    await finalizeReferralUse(env, userData.referred_code, username);
-  }
 
   const token = randomHex(24);
   // سشن به مدت ۳۰ روز معتبره
@@ -1578,13 +1603,6 @@ async function generateUniqueInviteCode(env) {
 //   );
 //   CREATE INDEX IF NOT EXISTS idx_referral_code_uses_code ON referral_code_uses(code);
 //
-// ستون‌های زیر برای «تأییدِ دیرهنگامِ کد معرف» لازمه: کد معرف موقعِ خودِ ثبت‌نام باطل/مصرف نمی‌شه؛
-// فقط وقتی کاربرِ تازه‌ثبت‌نام‌شده برای اولین‌بار با موفقیت وارد سایت بشه (اولین لاگین)، همون لحظه
-// finalizeReferralUse صدا زده می‌شه و مصرفِ واقعیِ کد (use_count/کول‌داون/صدورِ کدِ جدید برای معرف‌کننده)
-// انجام می‌شه. اگه کاربر هیچ‌وقت لاگین نکنه، کد هیچ‌وقت مصرف‌شده حساب نمی‌شه:
-//   ALTER TABLE users ADD COLUMN referred_code TEXT;
-//   ALTER TABLE users ADD COLUMN referral_confirmed INTEGER NOT NULL DEFAULT 0;
-//
 // منطق:
 // - فقط کاربرهایی که can_refer=1 دارن (یا مالک سایت که همیشه مجازه) می‌تونن کد معرفِ خودکارِ شخصی بسازن.
 //   این کدهای خودکار همیشه max_uses=1 (تک‌مصرفی) و بدون انقضا هستن، دقیقاً مثل قبل.
@@ -1637,58 +1655,6 @@ async function issueNewReferralCode(env, ownerUsername) {
     "INSERT INTO referral_codes (code, owner_username, used, created_at, max_uses, use_count, is_custom) VALUES (?, ?, 0, ?, 1, 0, 0)"
   ).bind(code, ownerUsername, Date.now()).run();
   return code;
-}
-
-// ---------- تأییدِ دیرهنگامِ کد معرف: فقط موقعِ اولین ورودِ موفقِ کاربرِ تازه‌ثبت‌نام‌شده صدا زده می‌شه ----------
-// تا این لحظه، خودِ کد معرف هنوز «مصرف‌نشده» حساب می‌شه (use_count/used دست‌نخورده مونده)؛ یعنی اگه
-// کاربر هیچ‌وقت لاگین نکنه، هیچ‌وقت این تابع اجرا نمی‌شه و کد هیچ‌وقت باطل نمی‌شه.
-async function finalizeReferralUse(env, referralCode, username) {
-  if (!referralCode) return;
-  const referralRow = await env.D1.prepare(
-    "SELECT code, owner_username, used, max_uses, use_count, expires_at, is_custom FROM referral_codes WHERE code = ?"
-  ).bind(referralCode).first();
-  if (!referralRow) return; // کد در همین فاصله از بین رفته؛ چیزی برای تأیید نیست
-
-  const maxUses = referralRow.max_uses || 1;
-  const useCount = referralRow.use_count || 0;
-  if (referralRow.used || useCount >= maxUses) return; // در همین فاصله (توسطِ یه کاربرِ دیگه) تکمیل شده
-
-  const now = Date.now();
-  const newUseCount = useCount + 1;
-  const exhausted = newUseCount >= maxUses ? 1 : 0;
-  await env.D1.prepare(
-    "UPDATE referral_codes SET used = ?, use_count = ?, used_by = ?, used_at = ? WHERE code = ?"
-  ).bind(exhausted, newUseCount, username, now, referralCode).run();
-  await env.D1.prepare(
-    "INSERT INTO referral_code_uses (id, code, used_by, used_at) VALUES (?, ?, ?, ?)"
-  ).bind(`${now}_${randomHex(4)}`, referralCode, username, now).run();
-
-  const ownerUsername = referralRow.owner_username;
-  if (referralRow.is_custom) {
-    // کدهای شخصی‌سازی‌شده مستقل از سیستمِ کول‌داون/کدِ خودکارِ شخصیِ صاحبشون هستن؛ چیزِ دیگه‌ای لازم نیست
-  } else if (isSuperAdmin(ownerUsername)) {
-    // مالک سایت محدودیت و کول‌داون نداره؛ همیشه یه کدِ فعالِ جدید داشته باشه
-    await issueNewReferralCode(env, ownerUsername);
-  } else {
-    const ownerRow = await env.D1.prepare(
-      "SELECT referral_success_count FROM users WHERE username = ?"
-    ).bind(ownerUsername).first();
-    const newCount = ((ownerRow && ownerRow.referral_success_count) || 0) + 1;
-    let cooldownUntil = null;
-    if (newCount % REFERRAL_SUCCESS_BATCH === 0) {
-      cooldownUntil = now + REFERRAL_COOLDOWN_MS;
-    }
-    await env.D1.prepare(
-      "UPDATE users SET referral_success_count = ?, referral_cooldown_until = ? WHERE username = ?"
-    ).bind(newCount, cooldownUntil, ownerUsername).run();
-
-    if (!cooldownUntil) {
-      // هنوز به سقفِ ۵‌تایی نرسیده؛ بلافاصله یه کدِ جدید براش بساز
-      await issueNewReferralCode(env, ownerUsername);
-    }
-  }
-
-  await env.D1.prepare("UPDATE users SET referral_confirmed = 1 WHERE username = ?").bind(username).run();
 }
 
 // ---------- وضعیت کد معرفِ کاربر جاری ----------
