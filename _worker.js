@@ -61,6 +61,14 @@ function bind(stmt, args) {
 // جدول posts از قبل توی D1 وجود داره، فقط این ستون رو (یک‌بار، توی کنسول D1) اضافه کن:
 //   ALTER TABLE posts ADD COLUMN title TEXT;
 
+// ================= مدت‌زمانِ آهنگ به ثانیه (برای زمان‌بندیِ رادیوی زنده) =================
+// این ستون رو هم (یک‌بار، توی کنسول D1) اضافه کن؛ فقط برای پست‌های نوع audio پر می‌شه:
+//   ALTER TABLE posts ADD COLUMN duration_seconds INTEGER;
+
+// ================= تیکِ «نمایش در رادیو دهات» (برای پس‌زمینه‌ی تمام‌صفحه‌ی رادیونما) =================
+// این ستون رو هم (یک‌بار، توی کنسول D1) اضافه کن؛ فقط برای پست‌های نوع photo/video معنی داره:
+//   ALTER TABLE posts ADD COLUMN radio_visual INTEGER NOT NULL DEFAULT 0;
+
 function base64UrlToUint8Array(base64Url) {
   const padding = "=".repeat((4 - (base64Url.length % 4)) % 4);
   const base64 = (base64Url + padding).replace(/-/g, "+").replace(/_/g, "/");
@@ -1178,9 +1186,18 @@ async function handlePost(request, env) {
   // ۴۳ نه ۴۰: چون کلاینت هر ۱۰ کاراکتر یه خط جدید (\n) اضافه می‌کنه، متنِ ۴۰‌کاراکتریِ فرمت‌شده
   // می‌تونه تا ۳ کاراکتر \n اضافه هم داشته باشه؛ برش با ۴۰ باعث قطع‌شدنِ انتهای خط آخر می‌شد
   const clientAudioFeeling = (form.get("audio_feeling") || "").toString().trim().slice(0, 43);
+  // مدت‌زمانِ آهنگ (ثانیه)؛ مرورگرِ کاربر خودش موقعِ آپلود با Audio API می‌خونتش و می‌فرسته — لازمِ
+  // زمان‌بندیِ رادیوی زنده‌ست (بدونِ این، سرور نمی‌دونه هر آهنگ کِی تموم می‌شه)
+  const clientAudioDurationRaw = Number(form.get("audio_duration"));
+  const clientAudioDuration = Number.isFinite(clientAudioDurationRaw) && clientAudioDurationRaw > 0 && clientAudioDurationRaw < 36000
+    ? Math.round(clientAudioDurationRaw)
+    : null;
   const audioCoverFile = form.get("audio_cover");
   const hasAudioCover = audioCoverFile && typeof audioCoverFile !== "string" && audioCoverFile.size > 0
     && audioCoverFile.size <= 5 * 1024 * 1024;
+  // تیکِ «نمایش در رادیو دهات»؛ فقط برای عکس/ویدیو معنی داره — یعنی این رسانه به‌عنوانِ پس‌زمینه‌ی
+  // تمام‌صفحه‌ی رادیونما (بدونِ صدا، هر ۴۵ ثانیه عوض می‌شه) هم استفاده بشه
+  const clientRadioVisual = ["1", "true", "on"].includes((form.get("radio_visual") || "").toString().trim().toLowerCase());
 
   // تگ‌ها: دقیقاً همون قانونِ تفکیکِ سمتِ کلاینت (با فاصله/کاما جدا می‌شن)، حداکثر ۶ تا و هر کدوم حداکثر ۳۰ کاراکتر
   const tagsRaw = (form.get("tags") || "").toString().trim();
@@ -1304,6 +1321,7 @@ async function handlePost(request, env) {
     audio_feeling: null,
     video_thumb: null,
     tags: tagsJson,
+    radio_visual: clientRadioVisual && (type === "photo" || type === "video") ? 1 : 0,
   };
   // نکته: قبلاً این شرط `result.audio &&` هم داشت که فقط وقتی صدق می‌کرد که خودِ handlePost مستقیم
   // فایل رو به تلگرام فرستاده باشه؛ برای مسیرِ آپلودِ چانکی (hasPreUploaded) چون فایل قبلاً (توی
@@ -1315,6 +1333,7 @@ async function handlePost(request, env) {
     post.audio_performer = clientAudioPerformer || (result.audio && result.audio.performer) || null;
     post.audio_thumb = audioCoverFileId || tagFileId(result.audio && result.audio.thumb && result.audio.thumb.file_id, result.__slot) || null;
     post.audio_feeling = clientAudioFeeling || null; // «حس من»: فقط تزیینیه، تو پخش تمام‌صفحه نشون داده می‌شه
+    post.duration_seconds = clientAudioDuration;
   }
   if (type === "video" && result.video) {
     // تلگرام خودش موقع آپلود ویدیو یه فریم رو به‌عنوان تامبنیل می‌سازه؛ همون رو ذخیره می‌کنیم
@@ -1326,10 +1345,10 @@ async function handlePost(request, env) {
   try {
     await bind(
       env.D1.prepare(
-        `INSERT INTO posts (id, username, text, title, type, file_id, message_id, bot_slot, date, upvotes, downvotes, likes, audio_title, audio_performer, audio_thumb, audio_feeling, video_thumb, tags)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, 0, ?, ?, ?, ?, ?, ?)`
+        `INSERT INTO posts (id, username, text, title, type, file_id, message_id, bot_slot, date, upvotes, downvotes, likes, audio_title, audio_performer, audio_thumb, audio_feeling, video_thumb, tags, duration_seconds, radio_visual)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, 0, ?, ?, ?, ?, ?, ?, ?, ?)`
       ),
-      [post.id, post.username, post.text, post.title, post.type, post.file_id, post.message_id, post.bot_slot, post.date, post.audio_title, post.audio_performer, post.audio_thumb, post.audio_feeling, post.video_thumb, post.tags]
+      [post.id, post.username, post.text, post.title, post.type, post.file_id, post.message_id, post.bot_slot, post.date, post.audio_title, post.audio_performer, post.audio_thumb, post.audio_feeling, post.video_thumb, post.tags, post.duration_seconds || null, post.radio_visual]
     ).run();
   } catch (err) {
     // اگه اینجا خطا بخوره (مثلاً یه مقدارِ نامعتبر برایِ D1)، قبلاً بدونِ گرفتنش می‌رفت به handlerِ
@@ -1346,14 +1365,218 @@ async function handlePost(request, env) {
 // #region پروکسی گرفتن فایل از تلگرام (بدون افشای توکن)
 // ---------- پروکسی گرفتن فایل از تلگرام (بدون افشای توکن) ----------
 // #endregion
-// #region مدیای اسپلشِ صفحه‌ی لاگین (ویدیو/آهنگِ درِ ورودی) — پروکسی و کش‌شده روی خودِ ورکر
-// ---------- مدیای اسپلشِ صفحه‌ی لاگین (ویدیو/آهنگِ درِ ورودی) ----------
-// چرا؟ قبلاً مرورگرِ کاربر مستقیم به api.github.com و jsDelivr/raw.githubusercontent.com وصل
-// می‌شد؛ این‌ها دامنه‌های خارجی‌ان و ممکنه از ایران کند/ناپایدار باشن. الان مرورگر فقط با دامنه‌ی
-// خودمون حرف می‌زنه: خودِ ورکر (که از شبکه‌ی داخلیِ کلادفلر به گیت‌هاب وصل می‌شه، نه از ایران)
-// لیست و فایل‌ها رو می‌گیره و رو edge کش می‌کنه. این صفحه قبل از لاگینه، پس این دو اندپوینت عمداً
-// بدون نیاز به توکن کار می‌کنن (محتوای عمومی/تزئینیه، نه دیتای کاربر).
-const SPLASH_MEDIA_REPO = "oldvasl/vasl";
+// #region رادیوی زنده (پخشِ همگام برای همه‌ی کاربرا، بدونِ نیاز به سرورِ استریمینگِ واقعی)
+// ---------- رادیوی زنده ----------
+// چون Cloudflare Worker نمی‌تونه یه پخشِ پیوسته و زنده نگه داره (هر درخواست جدا و کوتاه‌مدته)،
+// به‌جاش زمان‌بندی رو محاسبه می‌کنیم: یه چیدمانِ ثابت و قطعی (deterministic) از همه‌ی آهنگ‌ها
+// می‌سازیم (seed اون، تاریخِ امروزِ تهرانه — یعنی هر روز یه چیدمانِ تازه، ولی همه‌ی کاربرا دقیقاً
+// همون چیدمان رو حساب می‌کنن، بدونِ نیاز به ذخیره‌ی چیزی جایی). بعد با «الان چند ثانیه از نیمه‌شبِ
+// تهران گذشته، مودِ کل‌طولِ پلی‌لیست» دقیقاً مشخص می‌کنیم الان کدوم آهنگ و از کدوم ثانیه‌ش باید
+// پخش بشه — همه‌ی کاربرا همین محاسبه رو می‌کنن، پس همه هم‌زمان دقیقاً یه چیز می‌شنون.
+const RADIO_FALLBACK_DURATION_SECONDS = 180; // برای آهنگ‌های قدیمی‌تر که duration_seconds ندارن
+const TEHRAN_UTC_OFFSET_SECONDS = 3.5 * 3600; // ایران دیگه ساعتِ تابستانی نداره؛ آفستِ ثابت +۰۳:۳۰
+
+// PRNG سبک و قطعی (mulberry32)؛ با یه seed ثابت همیشه دقیقاً همون دنباله‌ی اعداد رو می‌ده
+function mulberry32(seed) {
+  let s = seed >>> 0;
+  return function () {
+    s = (s + 0x6d2b79f5) | 0;
+    let t = Math.imul(s ^ (s >>> 15), 1 | s);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+// جابه‌جاییِ فیشر-یتس با یه PRNG قطعی؛ همون seed = همیشه همون خروجی
+function seededShuffle(array, seed) {
+  const rng = mulberry32(seed);
+  const arr = array.slice();
+  for (let i = arr.length - 1; i > 0; i--) {
+    const j = Math.floor(rng() * (i + 1));
+    [arr[i], arr[j]] = [arr[j], arr[i]];
+  }
+  return arr;
+}
+
+async function handleRadioNow(request, env) {
+  const username = await getUserFromToken(request, env);
+  if (!username) return json({ error: "ابتدا وارد شو" }, 401);
+
+  const rows = await env.D1.prepare(
+    "SELECT id, username, file_id, audio_title, audio_performer, audio_thumb, duration_seconds FROM posts WHERE type = 'audio' ORDER BY id ASC"
+  ).all();
+  const tracks = rows.results || [];
+  if (tracks.length === 0) {
+    return json({ error: "هنوز هیچ آهنگی برای رادیو موجود نیست" }, 404);
+  }
+
+  const nowMs = Date.now();
+  const tehranNowSeconds = Math.floor(nowMs / 1000) + TEHRAN_UTC_OFFSET_SECONDS;
+  const secondsSinceTehranMidnight = tehranNowSeconds % 86400;
+  const tehranDaySeed = Math.floor(tehranNowSeconds / 86400); // یه عددِ صحیح که دقیقاً سرِ نیمه‌شبِ تهران عوض می‌شه
+
+  const shuffled = seededShuffle(tracks, tehranDaySeed);
+  const durations = shuffled.map((t) =>
+    Number.isFinite(t.duration_seconds) && t.duration_seconds > 0 ? t.duration_seconds : RADIO_FALLBACK_DURATION_SECONDS
+  );
+  const totalDuration = durations.reduce((a, b) => a + b, 0);
+  const elapsedInLoop = secondsSinceTehranMidnight % totalDuration;
+
+  let acc = 0;
+  let currentIndex = shuffled.length - 1;
+  let offsetInTrack = 0;
+  for (let i = 0; i < shuffled.length; i++) {
+    if (elapsedInLoop < acc + durations[i]) {
+      currentIndex = i;
+      offsetInTrack = elapsedInLoop - acc;
+      break;
+    }
+    acc += durations[i];
+  }
+
+  const current = shuffled[currentIndex];
+  const currentDuration = durations[currentIndex];
+  const remainingSeconds = Math.max(1, currentDuration - offsetInTrack);
+  const nextIndex = (currentIndex + 1) % shuffled.length;
+  const next = shuffled[nextIndex];
+
+  return json({
+    ok: true,
+    serverTime: nowMs,
+    trackIndex: currentIndex,
+    totalTracks: shuffled.length,
+    current: {
+      postId: current.id,
+      username: current.username,
+      title: current.audio_title || "بدون‌نام",
+      performer: current.audio_performer || "",
+      fileId: current.file_id,
+      thumbFileId: current.audio_thumb || null,
+      offsetSeconds: Math.floor(offsetInTrack),
+      durationSeconds: currentDuration,
+      remainingSeconds: Math.ceil(remainingSeconds),
+    },
+    next: {
+      title: next.audio_title || "بدون‌نام",
+      performer: next.audio_performer || "",
+    },
+  });
+}
+
+// ---------- پروکسیِ عمومیِ «فایل از یه پوشه‌ی گیت‌هاب» — با کشِ edge، بدونِ تماسِ مستقیمِ مرورگر با گیت‌هاب/jsDelivr ----------
+// چرا؟ اگه مرورگرِ کاربر مستقیم به api.github.com یا jsDelivr/raw.githubusercontent.com وصل بشه،
+// این‌ها دامنه‌های خارجی‌ان و ممکنه از ایران کند/ناپایدار باشن. به‌جاش خودِ ورکر (که از شبکه‌ی
+// داخلیِ کلادفلر به گیت‌هاب وصل می‌شه، نه از ایران) لیست و فایل‌ها رو می‌گیره و رو edge کش می‌کنه.
+// این تابعِ عمومیه؛ هم برای مدیای اسپلشِ لاگین استفاده می‌شه، هم برای صدای بین‌آهنگیِ رادیو.
+async function fetchGithubFolderList(repo, branch, folder, extRegex, cacheNamespace, ctx) {
+  const cache = caches.default;
+  const cacheKey = new Request(`https://${cacheNamespace}-list.internal/list`, { method: "GET" });
+  const cached = await cache.match(cacheKey);
+  if (cached) return cached;
+
+  const apiUrl = `https://api.github.com/repos/${repo}/contents/${folder}?ref=${branch}`;
+  const res = await fetch(apiUrl, { headers: { "User-Agent": "dehaat-worker", Accept: "application/vnd.github+json" } });
+  if (!res.ok) return json({ error: "لیست فایل‌ها گرفته نشد" }, 502);
+  const files = await res.json();
+
+  const names = (Array.isArray(files) ? files : [])
+    .filter((f) => f.type === "file" && extRegex.test(f.name))
+    .map((f) => f.name);
+
+  const response = json({ files: names });
+  // کشِ ۱۰دقیقه‌ای رو edge؛ هم لیمیتِ نرخِ API گیت‌هاب اذیت نمی‌شه، هم فایلِ تازه‌آپلودشده خیلی دیر ظاهر نمی‌شه
+  response.headers.set("Cache-Control", "public, max-age=600");
+  if (ctx) ctx.waitUntil(cache.put(cacheKey, response.clone()));
+  return response;
+}
+
+async function fetchGithubFolderFile(repo, branch, folder, name, allowedExtRegex, defaultContentType, cacheNamespace, request, ctx) {
+  // فقط اسمِ فایلِ ساده (بدون اسلش/دات‌دات) و فقط پسوندهای مجاز قبول می‌شن — جلوی path traversal رو می‌گیره
+  if (!name || !allowedExtRegex.test(name) || name.includes("..") || name.includes("/")) {
+    return json({ error: "نام فایل نامعتبره" }, 400);
+  }
+
+  const rangeHeader = request ? request.headers.get("Range") : null;
+  const cache = caches.default;
+  const cacheKey = new Request(`https://${cacheNamespace}-file.internal/${encodeURIComponent(name)}`, { method: "GET" });
+
+  // فقط جواب‌های کامل (بدون Range) کش می‌شن؛ Range (سیک‌کردنِ ویدیو/صدا) همیشه زنده گرفته می‌شه
+  if (!rangeHeader) {
+    const cached = await cache.match(cacheKey);
+    if (cached) return cached;
+  }
+
+  const sourceUrl = `https://raw.githubusercontent.com/${repo}/${branch}/${folder ? folder + "/" : ""}${encodeURIComponent(name)}`;
+  const sourceHeaders = {};
+  if (rangeHeader) sourceHeaders["Range"] = rangeHeader;
+
+  const fileRes = await fetch(sourceUrl, { headers: sourceHeaders });
+  if (!fileRes.ok && fileRes.status !== 206) return json({ error: "فایل پیدا نشد" }, 404);
+
+  const headers = new Headers();
+  headers.set("Content-Type", fileRes.headers.get("Content-Type") || defaultContentType);
+  headers.set("X-Content-Type-Options", "nosniff");
+  headers.set("Cache-Control", "public, max-age=86400");
+  headers.set("Accept-Ranges", "bytes");
+  const contentLength = fileRes.headers.get("Content-Length");
+  if (contentLength) headers.set("Content-Length", contentLength);
+  const contentRange = fileRes.headers.get("Content-Range");
+  if (contentRange) headers.set("Content-Range", contentRange);
+
+  const status = rangeHeader && fileRes.status === 206 ? 206 : 200;
+  const response = new Response(fileRes.body, { status, headers });
+
+  if (!rangeHeader && status === 200 && ctx) {
+    ctx.waitUntil(cache.put(cacheKey, response.clone()));
+  }
+  return response;
+}
+
+// ---------- چرخشِ پس‌زمینه‌ی رادیونما (عکس/ویدیوهایی که «نمایش در رادیو دهات» تیک خوردن) ----------
+// همون منطقِ رادیوی صوتی، ولی ساده‌تر: چون هر آیتم دقیقاً ۴۵ ثانیه می‌مونه (نه طولِ متغیر مثلِ
+// آهنگ‌ها)، لازم نیست تجمعی جمع بزنیم؛ فقط تقسیمِ صحیح کافیه. سیدِ متفاوت از رادیوی صوتی (با یه
+// افستِ ثابت) تا چیدمانِ تصویرها هم‌بسته با چیدمانِ آهنگ‌ها نباشه.
+const RADIO_VISUAL_SLOT_SECONDS = 45;
+const RADIO_VISUAL_SEED_OFFSET = 7331;
+
+async function handleRadioVisualNow(request, env) {
+  const username = await getUserFromToken(request, env);
+  if (!username) return json({ error: "ابتدا وارد شو" }, 401);
+
+  const rows = await env.D1.prepare(
+    "SELECT id, file_id, type FROM posts WHERE radio_visual = 1 ORDER BY id ASC"
+  ).all();
+  const visuals = rows.results || [];
+  if (visuals.length === 0) {
+    return json({ error: "هنوز هیچ رسانه‌ای برای رادیونما تیک نخورده" }, 404);
+  }
+
+  const nowMs = Date.now();
+  const tehranNowSeconds = Math.floor(nowMs / 1000) + TEHRAN_UTC_OFFSET_SECONDS;
+  const secondsSinceTehranMidnight = tehranNowSeconds % 86400;
+  const tehranDaySeed = Math.floor(tehranNowSeconds / 86400) + RADIO_VISUAL_SEED_OFFSET;
+
+  const shuffled = seededShuffle(visuals, tehranDaySeed);
+  const slotIndex = Math.floor(secondsSinceTehranMidnight / RADIO_VISUAL_SLOT_SECONDS) % shuffled.length;
+  const secondsIntoSlot = secondsSinceTehranMidnight % RADIO_VISUAL_SLOT_SECONDS;
+  const remainingSeconds = RADIO_VISUAL_SLOT_SECONDS - secondsIntoSlot;
+
+  const current = shuffled[slotIndex];
+
+  return json({
+    ok: true,
+    serverTime: nowMs,
+    slotSeconds: RADIO_VISUAL_SLOT_SECONDS,
+    remainingSeconds,
+    current: {
+      postId: current.id,
+      fileId: current.file_id,
+      type: current.type, // "photo" یا "video"
+    },
+  });
+}
+
+
 const SPLASH_MEDIA_BRANCH = "main";
 const SPLASH_MEDIA_FOLDER = "login";
 
@@ -1383,48 +1606,25 @@ async function handleSplashMediaList(env, ctx) {
 }
 
 async function handleSplashMediaFile(name, request, env, ctx) {
-  // فقط اسمِ فایلِ ساده (بدون اسلش/دات‌دات) و فقط پسوندِ mp4/mp3 قبول می‌شه — جلوی path traversal رو می‌گیره
-  if (!name || !/^[\w.\-]+\.(mp4|mp3)$/i.test(name) || name.includes("..") || name.includes("/")) {
-    return json({ error: "نام فایل نامعتبره" }, 400);
-  }
-
-  const rangeHeader = request ? request.headers.get("Range") : null;
-  const cache = caches.default;
-  const cacheKey = new Request(`https://splash-media-file.internal/${encodeURIComponent(name)}`, { method: "GET" });
-
-  // مثل handleMedia: فقط جواب‌های کامل (بدون Range) کش می‌شن؛ Range (سیک‌کردنِ ویدیو/صدا) همیشه زنده گرفته می‌شه
-  if (!rangeHeader) {
-    const cached = await cache.match(cacheKey);
-    if (cached) return cached;
-  }
-
-  const sourceUrl = `https://raw.githubusercontent.com/${SPLASH_MEDIA_REPO}/${SPLASH_MEDIA_BRANCH}/${SPLASH_MEDIA_FOLDER}/${encodeURIComponent(name)}`;
-  const sourceHeaders = {};
-  if (rangeHeader) sourceHeaders["Range"] = rangeHeader;
-
-  const fileRes = await fetch(sourceUrl, { headers: sourceHeaders });
-  if (!fileRes.ok && fileRes.status !== 206) return json({ error: "فایل پیدا نشد" }, 404);
-
-  const headers = new Headers();
-  headers.set(
-    "Content-Type",
-    fileRes.headers.get("Content-Type") || (/\.mp3$/i.test(name) ? "audio/mpeg" : "video/mp4")
+  return fetchGithubFolderFile(
+    SPLASH_MEDIA_REPO, SPLASH_MEDIA_BRANCH, SPLASH_MEDIA_FOLDER,
+    name, /^[\w.\-]+\.(mp4|mp3)$/i, /\.mp3$/i.test(name || "") ? "audio/mpeg" : "video/mp4",
+    "splash-media", request, ctx
   );
-  headers.set("X-Content-Type-Options", "nosniff");
-  headers.set("Cache-Control", "public, max-age=86400");
-  headers.set("Accept-Ranges", "bytes");
-  const contentLength = fileRes.headers.get("Content-Length");
-  if (contentLength) headers.set("Content-Length", contentLength);
-  const contentRange = fileRes.headers.get("Content-Range");
-  if (contentRange) headers.set("Content-Range", contentRange);
+}
 
-  const status = rangeHeader && fileRes.status === 206 ? 206 : 200;
-  const response = new Response(fileRes.body, { status, headers });
+// ---------- صدای بینِ‌آهنگیِ رادیو (جینگل/ترنزیشن) ----------
+// این ریپو/شاخه/پوشه رو با آدرسِ واقعیِ ریپوی «radio» که پرشون می‌کنی هماهنگ کن؛ فرض بر اینه که
+// چندتا فایلِ mp3 مستقیم تو ریشه‌ی همون ریپو (یا هر پوشه‌ای که RADIO_JINGLE_FOLDER مشخص می‌کنه) هست.
+const RADIO_JINGLE_REPO = "oldvasl/radio";
+const RADIO_JINGLE_BRANCH = "main";
+const RADIO_JINGLE_FOLDER = ""; // اگه فایل‌ها تو یه زیرپوشه‌ن، مثلاً "jingles"، همینو عوض کن
 
-  if (!rangeHeader && status === 200 && ctx) {
-    ctx.waitUntil(cache.put(cacheKey, response.clone()));
-  }
-  return response;
+async function handleRadioJingleList(env, ctx) {
+  return fetchGithubFolderList(RADIO_JINGLE_REPO, RADIO_JINGLE_BRANCH, RADIO_JINGLE_FOLDER, /^[\w.\-]+\.mp3$/i, "radio-jingle", ctx);
+}
+async function handleRadioJingleFile(name, request, env, ctx) {
+  return fetchGithubFolderFile(RADIO_JINGLE_REPO, RADIO_JINGLE_BRANCH, RADIO_JINGLE_FOLDER, name, /^[\w.\-]+\.mp3$/i, "audio/mpeg", "radio-jingle", request, ctx);
 }
 
 // #endregion
@@ -3238,7 +3438,65 @@ async function handleAdminGetChangelog(request, env) {
 }
 
 // #endregion
-// #region تعیین/تغییر رتبه‌ی ادمین (فقط مالک سایت)
+// #region سوییچِ HTTP/3 دامنه (فقط مالک سایت) — از طریق API خودِ کلادفلر
+// ---------- سوییچِ HTTP/3 دامنه (فقط مالک سایت) ----------
+// این مربوط به تنظیماتِ Zone تو کلادفلره، نه چیزی که این ورکر مستقیم کنترلش کنه؛ برای همین باید
+// از API خودِ کلادفلر استفاده کنیم. دو تا Secret تو تنظیماتِ ورکر لازمه:
+//   CF_API_TOKEN  = یه توکنِ API با دسترسیِ «Zone → Zone Settings → Edit» رویِ همون دامنه
+//   CF_ZONE_ID    = شناسه‌ی Zone دامنه (تو داشبورد کلادفلر → صفحه‌ی اصلیِ دامنه، پایینِ ستونِ راست)
+// اگه این دوتا ست نشده باشن، اندپوینت با یه خطای واضح جواب می‌ده (نه کرش خاموش).
+async function cloudflareApiFetch(env, path, options = {}) {
+  const res = await fetch(`https://api.cloudflare.com/client/v4${path}`, {
+    ...options,
+    headers: {
+      Authorization: `Bearer ${env.CF_API_TOKEN}`,
+      "Content-Type": "application/json",
+      ...(options.headers || {}),
+    },
+  });
+  const data = await res.json().catch(() => null);
+  if (!res.ok || !data || data.success !== true) {
+    const msg = data && data.errors && data.errors[0] ? data.errors[0].message : `کلادفلر خطای ${res.status} داد`;
+    throw new Error(msg);
+  }
+  return data;
+}
+
+async function handleAdminGetHttp3(request, env) {
+  const username = await getUserFromToken(request, env);
+  if (!username) return json({ error: "ابتدا وارد شو" }, 401);
+  if (!isSuperAdmin(username)) return json({ error: "فقط مالک سایت اجازه داره" }, 403);
+  if (!env.CF_API_TOKEN || !env.CF_ZONE_ID) {
+    return json({ error: "CF_API_TOKEN یا CF_ZONE_ID تو تنظیماتِ ورکر ست نشده" }, 500);
+  }
+  try {
+    const data = await cloudflareApiFetch(env, `/zones/${env.CF_ZONE_ID}/settings/http3`);
+    return json({ ok: true, enabled: data.result.value === "on" });
+  } catch (e) {
+    return json({ error: e.message || "گرفتنِ وضعیتِ HTTP/3 ناموفق بود" }, 502);
+  }
+}
+
+async function handleAdminToggleHttp3(request, env) {
+  const username = await getUserFromToken(request, env);
+  if (!username) return json({ error: "ابتدا وارد شو" }, 401);
+  if (!isSuperAdmin(username)) return json({ error: "فقط مالک سایت می‌تونه این تنظیم رو عوض کنه" }, 403);
+  if (!env.CF_API_TOKEN || !env.CF_ZONE_ID) {
+    return json({ error: "CF_API_TOKEN یا CF_ZONE_ID تو تنظیماتِ ورکر ست نشده" }, 500);
+  }
+  try {
+    const current = await cloudflareApiFetch(env, `/zones/${env.CF_ZONE_ID}/settings/http3`);
+    const newValue = current.result.value === "on" ? "off" : "on";
+    const updated = await cloudflareApiFetch(env, `/zones/${env.CF_ZONE_ID}/settings/http3`, {
+      method: "PATCH",
+      body: JSON.stringify({ value: newValue }),
+    });
+    return json({ ok: true, enabled: updated.result.value === "on" });
+  } catch (e) {
+    return json({ error: e.message || "تغییرِ HTTP/3 ناموفق بود" }, 502);
+  }
+}
+
 // ---------- تعیین/تغییر رتبه‌ی ادمین (فقط مالک سایت) ----------
 async function handleSetAdmin(request, env) {
   const username = await getUserFromToken(request, env);
@@ -5782,6 +6040,19 @@ async function routeRequest(url, request, env, ctx) {
       if (url.pathname === "/api/fcm/delete-token" && request.method === "POST") {
         return await handleDeleteFcmToken(request, env);
       }
+      if (url.pathname === "/api/radio/now" && request.method === "GET") {
+        return await handleRadioNow(request, env);
+      }
+      if (url.pathname === "/api/radio/visual-now" && request.method === "GET") {
+        return await handleRadioVisualNow(request, env);
+      }
+      if (url.pathname === "/api/radio/jingle/list" && request.method === "GET") {
+        return await handleRadioJingleList(env, ctx);
+      }
+      if (url.pathname.startsWith("/api/radio/jingle/file/") && request.method === "GET") {
+        const name = decodeURIComponent(url.pathname.slice("/api/radio/jingle/file/".length));
+        return await handleRadioJingleFile(name, request, env, ctx);
+      }
       if (url.pathname === "/api/splash-media/list" && request.method === "GET") {
         return await handleSplashMediaList(env, ctx);
       }
@@ -5882,6 +6153,12 @@ async function routeRequest(url, request, env, ctx) {
       }
       if (url.pathname === "/api/admin/changelog/current" && request.method === "GET") {
         return await handleAdminGetChangelog(request, env);
+      }
+      if (url.pathname === "/api/admin/cloudflare/http3" && request.method === "GET") {
+        return await handleAdminGetHttp3(request, env);
+      }
+      if (url.pathname === "/api/admin/cloudflare/http3" && request.method === "POST") {
+        return await handleAdminToggleHttp3(request, env);
       }
       if (url.pathname === "/api/chat/message/forward" && request.method === "POST") {
         return await handleChatForwardMessage(request, env);
