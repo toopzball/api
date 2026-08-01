@@ -1077,6 +1077,7 @@ function extractFileId(type, result) {
   if (type === "photo" && result.photo) id = result.photo[result.photo.length - 1].file_id;
   else if (type === "video" && result.video) id = result.video.file_id;
   else if (type === "audio" && result.audio) id = result.audio.file_id;
+  else if (type === "voice" && result.voice) id = result.voice.file_id;
   else if (type === "document" && result.document) id = result.document.file_id;
   else if (type === "animation" && result.animation) id = result.animation.file_id;
   return tagFileId(id, result.__slot);
@@ -1403,69 +1404,348 @@ function seededShuffle(array, seed) {
   return arr;
 }
 
+// ---------- موتورِ زمان‌بندیِ رادیو (state-machine واقعی) ----------
+// قبلاً این بخش کاملاً بی‌حافظه بود (فقط از رویِ ساعتِ دیواری حساب می‌شد) چون صف واقعی‌ای وجود
+// نداشت. الان که صفِ ویس داینامیکه (هر لحظه ممکنه یکی چیزی بفرسته)، دیگه نمی‌شه فقط با فرمول
+// حساب کرد؛ یه ردیفِ singleton تو جدولِ radio_state وضعیتِ فعلی (چه‌قسمتیه: آهنگ/ویس/مکث، از کِی
+// شروع شده، چقدر طول می‌کشه) رو نگه می‌داره و هر درخواست، تنبلانه (lazy) اونقدر جلو می‌برتش تا به
+// «الان» برسه — یعنی هیچ کرون/تایمرِ جدا لازم نیست، خودِ درخواست‌های کاربرا موتور رو می‌چرخونن.
+//
+// توالیِ هر قسمت: آهنگ → (اگه صفِ ویس چیزی داشت) ویسِ جلوترینِ صف → مکثِ کوتاه → آهنگِ بعدی → ...
+// اگه صف خالی بود، مستقیم از آهنگ به آهنگِ بعدی می‌ره (بدونِ ویس/مکثِ اضافه).
+//
+// نکته‌ی migration: قبل از دیپلوی این نسخه، این دو جدول رو یه‌بار تو کنسولِ D1 (داشبوردِ کلادفلر) اجرا کن:
+//
+//   CREATE TABLE radio_voice_queue (
+//     id INTEGER PRIMARY KEY AUTOINCREMENT,
+//     username TEXT NOT NULL,
+//     file_id TEXT NOT NULL,
+//     bot_slot INTEGER NOT NULL DEFAULT 1,
+//     duration_seconds INTEGER NOT NULL,
+//     status TEXT NOT NULL DEFAULT 'pending',
+//     created_at INTEGER NOT NULL,
+//     played_at INTEGER
+//   );
+//   CREATE INDEX idx_radio_voice_queue_status ON radio_voice_queue(status, created_at);
+//
+//   CREATE TABLE radio_state (
+//     id INTEGER PRIMARY KEY,
+//     segment_type TEXT NOT NULL,
+//     segment_start_ms INTEGER NOT NULL,
+//     segment_duration_seconds INTEGER NOT NULL,
+//     order_seed INTEGER NOT NULL,
+//     order_length INTEGER NOT NULL,
+//     song_cursor INTEGER NOT NULL DEFAULT 0,
+//     current_song_post_id TEXT,
+//     current_voice_id INTEGER
+//   );
+
+const RADIO_VOICE_PAUSE_SECONDS = 3; // مکثِ کوتاه بینِ پایانِ ویس و شروعِ آهنگِ بعدی
+const RADIO_VOICE_MAX_SECONDS = 20;
+
+async function getRadioTracks(env) {
+  const rows = await env.D1.prepare(
+    "SELECT id, username, file_id, audio_title, audio_performer, audio_thumb, duration_seconds FROM posts WHERE type = 'audio' ORDER BY id ASC"
+  ).all();
+  return rows.results || [];
+}
+
+function trackDurationSeconds(t) {
+  return Number.isFinite(t.duration_seconds) && t.duration_seconds > 0 ? t.duration_seconds : RADIO_FALLBACK_DURATION_SECONDS;
+}
+
+async function pickPendingVoice(env) {
+  return env.D1.prepare(
+    "SELECT id, username, file_id, duration_seconds FROM radio_voice_queue WHERE status = 'pending' ORDER BY created_at ASC LIMIT 1"
+  ).first();
+}
+
+async function loadRadioState(env) {
+  return env.D1.prepare("SELECT * FROM radio_state WHERE id = 1").first();
+}
+
+async function bootstrapRadioState(env, tracks, nowMs) {
+  const seed = Math.floor(Math.random() * 2 ** 31);
+  const order = seededShuffle(tracks, seed);
+  const first = order[0];
+  const state = {
+    segment_type: "song",
+    segment_start_ms: nowMs,
+    segment_duration_seconds: trackDurationSeconds(first),
+    order_seed: seed,
+    order_length: order.length,
+    song_cursor: 0,
+    current_song_post_id: first.id,
+    current_voice_id: null,
+  };
+  await env.D1.prepare(
+    `INSERT INTO radio_state (id, segment_type, segment_start_ms, segment_duration_seconds, order_seed, order_length, song_cursor, current_song_post_id, current_voice_id)
+     VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?)
+     ON CONFLICT(id) DO UPDATE SET segment_type=excluded.segment_type, segment_start_ms=excluded.segment_start_ms,
+       segment_duration_seconds=excluded.segment_duration_seconds, order_seed=excluded.order_seed, order_length=excluded.order_length,
+       song_cursor=excluded.song_cursor, current_song_post_id=excluded.current_song_post_id, current_voice_id=excluded.current_voice_id`
+  ).bind(state.segment_type, state.segment_start_ms, state.segment_duration_seconds, state.order_seed, state.order_length, state.song_cursor, state.current_song_post_id, state.current_voice_id).run();
+  return state;
+}
+
+// یه قدم جلو می‌ره: قسمتِ فعلی (که تازه تموم شده) رو می‌بنده و قسمتِ بعدی رو می‌سازه. چیزی رو خودش
+// ذخیره نمی‌کنه (فراخوان مسئولِ persist‌کردنه)، چون ممکنه لازم باشه چند قدم پشتِ‌سرِهم جلو بریم.
+async function advanceRadioSegment(env, tracks, state, segEndMs) {
+  if (state.segment_type === "song") {
+    const voice = await pickPendingVoice(env);
+    if (voice) {
+      return {
+        segment_type: "voice",
+        segment_start_ms: segEndMs,
+        segment_duration_seconds: Math.min(RADIO_VOICE_MAX_SECONDS, voice.duration_seconds || RADIO_VOICE_MAX_SECONDS),
+        order_seed: state.order_seed,
+        order_length: state.order_length,
+        song_cursor: state.song_cursor,
+        current_song_post_id: state.current_song_post_id,
+        current_voice_id: voice.id,
+      };
+    }
+    return nextSongSegment(tracks, state, segEndMs);
+  }
+  if (state.segment_type === "voice") {
+    if (state.current_voice_id) {
+      await env.D1.prepare("UPDATE radio_voice_queue SET status = 'played', played_at = ? WHERE id = ? AND status = 'pending'")
+        .bind(segEndMs, state.current_voice_id)
+        .run();
+    }
+    return {
+      segment_type: "pause",
+      segment_start_ms: segEndMs,
+      segment_duration_seconds: RADIO_VOICE_PAUSE_SECONDS,
+      order_seed: state.order_seed,
+      order_length: state.order_length,
+      song_cursor: state.song_cursor,
+      current_song_post_id: state.current_song_post_id,
+      current_voice_id: null,
+    };
+  }
+  // pause -> آهنگِ بعدی
+  return nextSongSegment(tracks, state, segEndMs);
+}
+
+// آهنگِ بعدیِ چیدمان رو برمی‌گردونه (بدونِ هیچ فچِ دیتابیسی؛ فقط رویِ آرایه‌ی tracksِ همین درخواست کار می‌کنه)
+function nextSongSegment(tracks, state, segEndMs) {
+  let nextCursor = state.song_cursor + 1;
+  let seed = state.order_seed;
+  let order = seededShuffle(tracks, seed);
+  if (nextCursor >= order.length) {
+    // یه دور کامل تموم شد؛ دوباره قاطی می‌کنیم (seedِ جدید) — این‌جوری آهنگ‌های تازه‌آپلودشده هم
+    // از دورِ بعد وارد چرخش می‌شن و چیدمان هر دور با دورِ قبل فرق می‌کنه
+    seed = Math.floor(Math.random() * 2 ** 31);
+    order = seededShuffle(tracks, seed);
+    nextCursor = 0;
+  }
+  const next = order[nextCursor] || order[0];
+  return {
+    segment_type: "song",
+    segment_start_ms: segEndMs,
+    segment_duration_seconds: trackDurationSeconds(next),
+    order_seed: seed,
+    order_length: order.length,
+    song_cursor: nextCursor,
+    current_song_post_id: next.id,
+    current_voice_id: null,
+  };
+}
+
+async function persistRadioState(env, prevStartMs, state) {
+  // optimistic concurrency: فقط اگه از وقتی این درخواست state رو خونده، کسِ دیگه‌ای زودتر جلوش
+  // نبرده باشه (segment_start_ms هنوز همونیه که خوندیم) آپدیت می‌کنیم. اگه یه درخواستِ هم‌زمانِ
+  // دیگه زودتر برده باشدش، همین یه‌بار می‌بازیم — بدونِ فاجعه، دفعه‌ی بعد state تازه رو می‌خونیم.
+  const res = await env.D1.prepare(
+    `UPDATE radio_state SET segment_type=?, segment_start_ms=?, segment_duration_seconds=?, order_seed=?, order_length=?, song_cursor=?, current_song_post_id=?, current_voice_id=?
+     WHERE id = 1 AND segment_start_ms = ?`
+  )
+    .bind(
+      state.segment_type, state.segment_start_ms, state.segment_duration_seconds, state.order_seed,
+      state.order_length, state.song_cursor, state.current_song_post_id, state.current_voice_id, prevStartMs
+    )
+    .run();
+  return !!(res.meta && res.meta.changes > 0);
+}
+
 async function handleRadioNow(request, env) {
   const username = await getUserFromToken(request, env);
   if (!username) return json({ error: "ابتدا وارد شو" }, 401);
 
-  const rows = await env.D1.prepare(
-    "SELECT id, username, file_id, audio_title, audio_performer, audio_thumb, duration_seconds FROM posts WHERE type = 'audio' ORDER BY id ASC"
-  ).all();
-  const tracks = rows.results || [];
+  const tracks = await getRadioTracks(env);
   if (tracks.length === 0) {
     return json({ error: "هنوز هیچ آهنگی برای رادیو موجود نیست" }, 404);
   }
 
   const nowMs = Date.now();
-  const tehranNowSeconds = Math.floor(nowMs / 1000) + TEHRAN_UTC_OFFSET_SECONDS;
-  const secondsSinceTehranMidnight = tehranNowSeconds % 86400;
-  const tehranDaySeed = Math.floor(tehranNowSeconds / 86400); // یه عددِ صحیح که دقیقاً سرِ نیمه‌شبِ تهران عوض می‌شه
+  let state = await loadRadioState(env);
+  if (!state) state = await bootstrapRadioState(env, tracks, nowMs);
 
-  const shuffled = seededShuffle(tracks, tehranDaySeed);
-  const durations = shuffled.map((t) =>
-    Number.isFinite(t.duration_seconds) && t.duration_seconds > 0 ? t.duration_seconds : RADIO_FALLBACK_DURATION_SECONDS
-  );
-  const totalDuration = durations.reduce((a, b) => a + b, 0);
-  const elapsedInLoop = secondsSinceTehranMidnight % totalDuration;
-
-  let acc = 0;
-  let currentIndex = shuffled.length - 1;
-  let offsetInTrack = 0;
-  for (let i = 0; i < shuffled.length; i++) {
-    if (elapsedInLoop < acc + durations[i]) {
-      currentIndex = i;
-      offsetInTrack = elapsedInLoop - acc;
-      break;
+  // اگه قسمتِ فعلی تموم شده، جلو می‌بریمش — ممکنه چند قدم پشتِ‌سرِهم لازم باشه (مثلاً سرور یه مدت
+  // هیچ درخواستی نداشته)؛ سقفِ ۲۰ قدم فقط برای جلوگیری از حلقه‌ی بی‌نهایتِ احتمالیه.
+  const startedAtMs = state.segment_start_ms;
+  let steps = 0;
+  while (nowMs >= state.segment_start_ms + state.segment_duration_seconds * 1000 && steps < 20) {
+    const segEnd = state.segment_start_ms + state.segment_duration_seconds * 1000;
+    state = await advanceRadioSegment(env, tracks, state, segEnd);
+    steps++;
+  }
+  if (steps > 0) {
+    const persisted = await persistRadioState(env, startedAtMs, state);
+    if (!persisted) {
+      const fresh = await loadRadioState(env);
+      if (fresh) state = fresh;
     }
-    acc += durations[i];
   }
 
-  const current = shuffled[currentIndex];
-  const currentDuration = durations[currentIndex];
-  const remainingSeconds = Math.max(1, currentDuration - offsetInTrack);
-  const nextIndex = (currentIndex + 1) % shuffled.length;
-  const next = shuffled[nextIndex];
+  const offsetInSegment = Math.max(0, (nowMs - state.segment_start_ms) / 1000);
+  const remainingSeconds = Math.max(1, state.segment_duration_seconds - offsetInSegment);
+
+  let current;
+  if (state.segment_type === "voice") {
+    const voice = await env.D1.prepare("SELECT id, username, file_id FROM radio_voice_queue WHERE id = ?").bind(state.current_voice_id).first();
+    if (voice) {
+      const senderProfile = await env.D1.prepare("SELECT avatar_file_id FROM profiles WHERE username = ?").bind(voice.username).first();
+      current = {
+        segmentType: "voice",
+        voiceId: voice.id,
+        username: voice.username,
+        avatarFileId: (senderProfile && senderProfile.avatar_file_id) || null,
+        fileId: voice.file_id,
+        startMs: state.segment_start_ms,
+        offsetSeconds: Math.floor(offsetInSegment),
+        durationSeconds: state.segment_duration_seconds,
+        remainingSeconds: Math.ceil(remainingSeconds),
+      };
+    } else {
+      // ویس یهو حذف شده (خیلی نادر)؛ به‌جای خطا دادن، همین لحظه رو مثلِ یه مکثِ کوتاه نشون می‌دیم
+      current = { segmentType: "pause", startMs: state.segment_start_ms, offsetSeconds: 0, durationSeconds: RADIO_VOICE_PAUSE_SECONDS, remainingSeconds: RADIO_VOICE_PAUSE_SECONDS };
+    }
+  } else if (state.segment_type === "pause") {
+    current = {
+      segmentType: "pause",
+      startMs: state.segment_start_ms,
+      offsetSeconds: Math.floor(offsetInSegment),
+      durationSeconds: state.segment_duration_seconds,
+      remainingSeconds: Math.ceil(remainingSeconds),
+    };
+  } else {
+    const song = tracks.find((t) => t.id === state.current_song_post_id) || tracks[0];
+    const senderProfile = await env.D1.prepare("SELECT avatar_file_id FROM profiles WHERE username = ?").bind(song.username).first();
+    current = {
+      segmentType: "song",
+      postId: song.id,
+      username: song.username,
+      avatarFileId: (senderProfile && senderProfile.avatar_file_id) || null,
+      title: song.audio_title || "بدون‌نام",
+      performer: song.audio_performer || "",
+      fileId: song.file_id,
+      thumbFileId: song.audio_thumb || null,
+      startMs: state.segment_start_ms,
+      offsetSeconds: Math.floor(offsetInSegment),
+      durationSeconds: state.segment_duration_seconds,
+      remainingSeconds: Math.ceil(remainingSeconds),
+    };
+  }
+
+  // پیش‌نمایشِ «بعدی»: فقط وقتی قسمتِ فعلی آهنگه معنی‌دار حدس زده می‌شه — اگه صفِ ویس همین الان
+  // چیزی داره، بعدی تقریباً قطعاً ویسه؛ وگرنه آهنگِ بعدیِ چیدمان (بدونِ persist کردن، فقط یه پیش‌بینی)
+  let next = null;
+  if (state.segment_type === "song") {
+    const pendingVoice = await pickPendingVoice(env);
+    if (pendingVoice) {
+      next = { type: "voice" };
+    } else {
+      const peek = nextSongSegment(tracks, state, 0);
+      const nextSong = tracks.find((t) => t.id === peek.current_song_post_id);
+      next = { type: "song", title: (nextSong && nextSong.audio_title) || "بدون‌نام", performer: (nextSong && nextSong.audio_performer) || "" };
+    }
+  }
+
+  const pendingCountRow = await env.D1.prepare("SELECT COUNT(*) AS cnt FROM radio_voice_queue WHERE status = 'pending'").first();
 
   return json({
     ok: true,
     serverTime: nowMs,
-    trackIndex: currentIndex,
-    totalTracks: shuffled.length,
-    current: {
-      postId: current.id,
-      username: current.username,
-      title: current.audio_title || "بدون‌نام",
-      performer: current.audio_performer || "",
-      fileId: current.file_id,
-      thumbFileId: current.audio_thumb || null,
-      offsetSeconds: Math.floor(offsetInTrack),
-      durationSeconds: currentDuration,
-      remainingSeconds: Math.ceil(remainingSeconds),
-    },
-    next: {
-      title: next.audio_title || "بدون‌نام",
-      performer: next.audio_performer || "",
-    },
+    current,
+    next,
+    queueLength: (pendingCountRow && pendingCountRow.cnt) || 0,
   });
+}
+
+// ---------- ثبتِ ویسِ کاربر تو صفِ رادیو ----------
+async function handleRadioVoiceSubmit(request, env) {
+  const username = await getUserFromToken(request, env);
+  if (!username) return json({ error: "ابتدا وارد شو" }, 401);
+
+  if (!(await checkRateLimit(env, "radio_voice", username, 3, 600))) {
+    return json({ error: "زیاد ویس فرستادی، چند دقیقه دیگه امتحان کن" }, 429);
+  }
+
+  const form = await request.formData();
+  const file = form.get("file");
+  if (!file || typeof file === "string" || file.size === 0) {
+    return json({ error: "ویسی دریافت نشد" }, 400);
+  }
+  if (file.size > 3 * 1024 * 1024) {
+    return json({ error: "حجمِ ویس بیش از حدِ مجازه" }, 400);
+  }
+  if (!/^audio\//.test(file.type)) {
+    return json({ error: "فقط فایلِ صوتی قابلِ ارسال به صفِ رادیوعه" }, 400);
+  }
+
+  const durationRaw = Number(form.get("duration"));
+  const duration = Number.isFinite(durationRaw) && durationRaw > 0 ? Math.min(RADIO_VOICE_MAX_SECONDS, Math.round(durationRaw)) : null;
+  if (!duration) return json({ error: "مدت‌زمانِ ویس نامعتبره" }, 400);
+
+  let result;
+  try {
+    result = await sendTelegramFile(env, "sendVoice", "voice", file, `ویسِ رادیو — ${username}`);
+  } catch (err) {
+    console.error("خطای ارسالِ ویسِ رادیو به تلگرام:", err);
+    return json({ error: "ارسالِ ویس ناموفق بود، دوباره امتحان کن" }, 502);
+  }
+
+  const fileId = extractFileId("voice", result);
+  if (!fileId) return json({ error: "دریافتِ شناسه‌ی فایل ناموفق بود" }, 502);
+
+  const createdAt = Date.now();
+  await env.D1.prepare(
+    "INSERT INTO radio_voice_queue (username, file_id, bot_slot, duration_seconds, status, created_at) VALUES (?, ?, ?, ?, 'pending', ?)"
+  )
+    .bind(username, fileId, result.__slot || 1, duration, createdAt)
+    .run();
+
+  const positionRow = await env.D1.prepare(
+    "SELECT COUNT(*) AS cnt FROM radio_voice_queue WHERE status = 'pending' AND created_at <= ?"
+  )
+    .bind(createdAt)
+    .first();
+
+  return json({ ok: true, position: (positionRow && positionRow.cnt) || 1 });
+}
+
+// موقعیتِ فعلیِ کاربر تو صفِ ویس (اگه چیزی تو صف داره)؛ برای اینکه بعد از رفرش/بازکردنِ دوباره‌ی
+// صفحه هم بتونه ببینه نفرِ چندمه، نه فقط لحظه‌ی ارسال
+async function handleRadioVoiceMine(request, env) {
+  const username = await getUserFromToken(request, env);
+  if (!username) return json({ error: "ابتدا وارد شو" }, 401);
+
+  const row = await env.D1.prepare(
+    "SELECT id, created_at FROM radio_voice_queue WHERE username = ? AND status = 'pending' ORDER BY created_at ASC LIMIT 1"
+  )
+    .bind(username)
+    .first();
+  if (!row) return json({ ok: true, pending: null });
+
+  const positionRow = await env.D1.prepare(
+    "SELECT COUNT(*) AS cnt FROM radio_voice_queue WHERE status = 'pending' AND created_at <= ?"
+  )
+    .bind(row.created_at)
+    .first();
+
+  return json({ ok: true, pending: { position: (positionRow && positionRow.cnt) || 1 } });
 }
 
 // ---------- پروکسیِ عمومیِ «فایل از یه پوشه‌ی گیت‌هاب» — با کشِ edge، بدونِ تماسِ مستقیمِ مرورگر با گیت‌هاب/jsDelivr ----------
@@ -5977,6 +6257,12 @@ async function routeRequest(url, request, env, ctx) {
       }
       if (url.pathname === "/api/radio/now" && request.method === "GET") {
         return await handleRadioNow(request, env);
+      }
+      if (url.pathname === "/api/radio/voice" && request.method === "POST") {
+        return await handleRadioVoiceSubmit(request, env);
+      }
+      if (url.pathname === "/api/radio/voice/mine" && request.method === "GET") {
+        return await handleRadioVoiceMine(request, env);
       }
       if (url.pathname === "/api/radio/visual-now" && request.method === "GET") {
         return await handleRadioVisualNow(request, env);
