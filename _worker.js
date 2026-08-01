@@ -1674,7 +1674,36 @@ async function handleRadioNow(request, env) {
   });
 }
 
-// ---------- ثبتِ ویسِ کاربر تو صفِ رادیو ----------
+// ---------- اصلاحِ عقب‌ماندگیِ duration برای آهنگ‌های قدیمی/مشکل‌دار ----------
+// قبل از این‌که audio_duration درست فرستاده بشه، duration_seconds برای همه‌ی آهنگ‌های قدیمی
+// null بود (و رادیو از مقدارِ پیش‌فرضِ ۱۸۰ ثانیه استفاده می‌کرد). این دو اندپوینت به ادمین اجازه
+// می‌ده از تویِ خودِ مرورگر (که واقعاً می‌تونه فایل رو دیکد کنه و طولِ واقعیش رو بفهمه — چیزی که
+// خودِ ورکر توانایی‌شو نداره) این عددا رو یکی‌یکی درست کنه.
+async function handleRadioDurationsMissing(request, env) {
+  const username = await getUserFromToken(request, env);
+  if (!username || !(await isAdminUser(env, username))) return json({ error: "دسترسی نداری" }, 403);
+
+  const rows = await env.D1.prepare(
+    "SELECT id, file_id, audio_title FROM posts WHERE type = 'audio' AND (duration_seconds IS NULL OR duration_seconds <= 0) ORDER BY id ASC LIMIT 25"
+  ).all();
+  return json({ ok: true, items: (rows.results || []).map((r) => ({ postId: r.id, fileId: r.file_id, title: r.audio_title || "بدون‌نام" })) });
+}
+
+async function handleRadioDurationsFix(request, env) {
+  const username = await getUserFromToken(request, env);
+  if (!username || !(await isAdminUser(env, username))) return json({ error: "دسترسی نداری" }, 403);
+
+  const body = await request.json().catch(() => ({}));
+  const postId = body.postId;
+  const duration = Number(body.duration);
+  if (!postId || !Number.isFinite(duration) || duration <= 0) {
+    return json({ error: "ورودی نامعتبره" }, 400);
+  }
+  await env.D1.prepare("UPDATE posts SET duration_seconds = ? WHERE id = ? AND type = 'audio'")
+    .bind(Math.round(duration), postId)
+    .run();
+  return json({ ok: true });
+}
 async function handleRadioVoiceSubmit(request, env) {
   const username = await getUserFromToken(request, env);
   if (!username) return json({ error: "ابتدا وارد شو" }, 401);
@@ -6263,6 +6292,12 @@ async function routeRequest(url, request, env, ctx) {
       }
       if (url.pathname === "/api/radio/voice/mine" && request.method === "GET") {
         return await handleRadioVoiceMine(request, env);
+      }
+      if (url.pathname === "/api/radio/durations/missing" && request.method === "GET") {
+        return await handleRadioDurationsMissing(request, env);
+      }
+      if (url.pathname === "/api/radio/durations/fix" && request.method === "POST") {
+        return await handleRadioDurationsFix(request, env);
       }
       if (url.pathname === "/api/radio/visual-now" && request.method === "GET") {
         return await handleRadioVisualNow(request, env);
