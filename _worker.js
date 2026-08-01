@@ -1566,7 +1566,20 @@ async function handleRadioVisualNow(request, env) {
   const secondsIntoSlot = secondsSinceTehranMidnight % RADIO_VISUAL_SLOT_SECONDS;
   const remainingSeconds = RADIO_VISUAL_SLOT_SECONDS - secondsIntoSlot;
 
-  const current = shuffled[slotIndex];
+  // با یه چیدمانِ ثابت، دو تا اسلاتِ پشتِ‌سرِهم عملاً هیچ‌وقت نباید یه آیتمِ تکراری بدن (چون shuffled
+  // یه‌جایگشتِ بدونِ تکراره). ولی چون لیستِ رسانه‌های تیک‌خورده هر لحظه ممکنه عوض بشه (یکی تازه تیک زده/
+  // برداشته)، «چیدمانِ ثابت» فقط تو یه درخواستِ واحد معتبره؛ اگه بینِ دو تا اسلاتِ متوالی این لیست عوض
+  // بشه، این تضمین از بین می‌ره. برای اطمینان، صریحاً چک می‌کنیم و اگه تصادفاً با اسلاتِ قبلی یکی
+  // دراومد، یکی جلوتر می‌ریم — این کارِ قطعیه (نه رندوم)، پس همه‌ی بیننده‌ها همچنان یه چیزِ یکسان می‌بینن.
+  let effectiveIndex = slotIndex;
+  if (shuffled.length > 1) {
+    const prevIndex = (slotIndex - 1 + shuffled.length) % shuffled.length;
+    if (shuffled[prevIndex].id === shuffled[effectiveIndex].id) {
+      effectiveIndex = (effectiveIndex + 1) % shuffled.length;
+    }
+  }
+
+  const current = shuffled[effectiveIndex];
 
   return json({
     ok: true,
