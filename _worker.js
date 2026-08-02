@@ -4,7 +4,7 @@
 const SUPER_ADMIN_USERNAME = "Aghey";
 
 // فقط این دامنه‌ها اجازه دارن از مرورگر به این ورکر درخواست بزنن
-const ALLOWED_ORIGINS = ["https://oldvasl.github.io", "https://dehaat.faggott.fun", "https://dehat.netlify.app", "https://dehaato.pages.dev", "https://dehaat.aghey.faggott.fun"];
+const ALLOWED_ORIGINS = ["https://dehaat.faggott.fun", "https://dehaato.pages.dev", "https://dehaat.aghey.faggott.fun", "https://dehaat.bbboi.ir"];
 
 // بر اساس Origin درخواست، هدرهای CORS مناسب رو می‌سازه
 // (اگه Origin توی لیست مجاز نبود، هدر Allow-Origin اصلاً ست نمی‌شه؛
@@ -7184,10 +7184,16 @@ export default {
     const corsHeaders = corsHeadersFor(request);
 
     // این ورکر دیگه نباید مستقیم صدا زده بشه؛ فقط از طریق ورکر پروکسیِ جلوش. پروکسی یه هدر
-    // مخفی مشترک (X-Internal-Key) اضافه می‌کنه که فقط بین دو ورکر شناخته‌شده‌ست. اگه این هدر
-    // نبود یا اشتباه بود، یعنی درخواست مستقیم اومده (curl، پستمن...) و رد می‌شه.
+    // مخفی مشترک (X-Internal-Key) اضافه می‌کنه که فقط بین دو ورکر شناخته‌شده‌ست. یه استثنا هم
+    // داریم: وقتی فرانت‌اند از پشتِ GitHub Pages سرو می‌شه (که نمی‌تونه پروکسی/فانکشن اجرا کنه)،
+    // درخواست‌های مستقیم از همون Originِ شناخته‌شده (dehaat.bbboi.ir) هم مجازن — بدونِ نیاز به کلید.
+    // اگه هیچ‌کدوم از این دو شرط برقرار نبود (یعنی درخواست مستقیم از curl/Postman/جای ناشناس اومده)، رد می‌شه.
+    const DIRECT_ALLOWED_ORIGINS = ["https://dehaat.bbboi.ir"];
+    const requestOrigin = request.headers.get("Origin");
     const internalKey = request.headers.get("X-Internal-Key");
-    if (!env.INTERNAL_KEY || internalKey !== env.INTERNAL_KEY) {
+    const hasValidInternalKey = env.INTERNAL_KEY && internalKey === env.INTERNAL_KEY;
+    const isAllowedDirectOrigin = requestOrigin && DIRECT_ALLOWED_ORIGINS.includes(requestOrigin);
+    if (!hasValidInternalKey && !isAllowedDirectOrigin) {
       const denied = json({ error: "دسترسی مستقیم مجاز نیست" }, 403);
       for (const [key, value] of Object.entries(corsHeaders)) {
         denied.headers.set(key, value);
