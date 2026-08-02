@@ -73,6 +73,10 @@ function bind(stmt, args) {
 // این ستون رو هم (یک‌بار، توی کنسول D1) اضافه کن:
 //   ALTER TABLE posts ADD COLUMN pinned INTEGER NOT NULL DEFAULT 0;
 
+// ================= ویرایشِ پست توسط صاحبش (منوی سه‌نقطه‌ی پست کارت) =================
+// این ستون رو هم (یک‌بار، توی کنسول D1) اضافه کن:
+//   ALTER TABLE posts ADD COLUMN edited INTEGER NOT NULL DEFAULT 0;
+
 function base64UrlToUint8Array(base64Url) {
   const padding = "=".repeat((4 - (base64Url.length % 4)) % 4);
   const base64 = (base64Url + padding).replace(/-/g, "+").replace(/_/g, "/");
@@ -554,6 +558,7 @@ async function detectRealMediaCategory(file) {
 
 // چک می‌کنه محتوای واقعیِ فایل با دسته‌ی ادعاشده (image/video/audio) هم‌خونی داره یا نه
 async function verifyFileMatchesCategory(file, claimedCategory) {
+  if (claimedCategory === "file") return true; // فایلِ عمومی: هیچ محدودیتِ نوعی نداره، پس چیزی برای تاییدِ محتوا نیست
   const real = await detectRealMediaCategory(file);
   if (!real) return false;
   if (real === claimedCategory) return true;
@@ -2999,6 +3004,63 @@ async function handleDeletePost(request, env) {
 }
 
 // #endregion
+// #region ویرایشِ پست (فقط صاحبِ پست، فقط متن/عنوان/تگ‌ها)
+// ---------- ویرایشِ پست (فقط صاحبِ پست می‌تونه؛ فایل/مدیای پست قابلِ تغییر نیست، فقط متن/عنوان/تگ) ----------
+async function handleEditPost(request, env) {
+  const username = await getUserFromToken(request, env);
+  if (!username) return json({ error: "ابتدا وارد شو" }, 401);
+
+  let body;
+  try {
+    body = await request.json();
+  } catch (e) {
+    return json({ error: "درخواست نامعتبره" }, 400);
+  }
+
+  const id = (body.id || "").toString();
+  if (!id) return json({ error: "شناسه پست لازمه" }, 400);
+
+  const post = await env.D1.prepare("SELECT * FROM posts WHERE id = ?").bind(id).first();
+  if (!post) return json({ error: "پست پیدا نشد" }, 404);
+  if (post.username !== username) return json({ error: "فقط صاحبِ پست می‌تونه ویرایشش کنه" }, 403);
+
+  const text = (body.text || "").toString().trim();
+  const title = (body.title || "").toString().trim().slice(0, 15);
+  const hasMedia = post.type === "photo" || post.type === "video" || post.type === "audio" || post.type === "document";
+  if (!text && !hasMedia) return json({ error: "پست نمی‌تونه خالی باشه" }, 400);
+  if (text.length > 2000) return json({ error: "متن خیلی طولانیه" }, 400);
+  if (title.length > 15) return json({ error: "عنوان نباید بیشتر از ۱۵ کاراکتر باشه" }, 400);
+
+  const tagsRaw = (body.tags || "").toString().trim();
+  let tags = [];
+  if (tagsRaw) {
+    tags = tagsRaw
+      .split(/[\s,،]+/)
+      .filter(Boolean)
+      .map((t) => t.slice(0, 30))
+      .slice(0, 6);
+  }
+  const tagsJson = tags.length ? JSON.stringify(tags) : null;
+
+  await env.D1.prepare("UPDATE posts SET text = ?, title = ?, tags = ?, edited = 1 WHERE id = ?")
+    .bind(text || null, title || null, tagsJson, id)
+    .run();
+
+  // به‌روزرسانیِ کپشنِ پیامِ تلگرام هم (best-effort؛ اگه شکست بخوره جلویِ ثبتِ ویرایش رو نمی‌گیره)
+  try {
+    if (post.message_id) {
+      const caption = text ? `${username}\n\n${text}` : username;
+      const slot = untagFileId(post.file_id || "").slot;
+      await editTelegramCaption(env, env.CHANNEL_ID, post.message_id, caption, slot);
+    }
+  } catch (err) {
+    // مهم نیست، ادامه می‌دیم
+  }
+
+  return json({ ok: true, id, text, title, tags });
+}
+
+// #endregion
 // #region پین‌کردنِ پست توسط ادمین
 // ---------- پین/آن‌پینِ پست (فقط مالکِ سایت، دقیقاً همون سطحِ دسترسیِ حذفِ پستِ دیگران) ----------
 async function handlePinPost(request, env) {
@@ -4109,7 +4171,7 @@ async function handleAdminChatMessages(request, env) {
   const after = url.searchParams.get("after");
   if (after) {
     const rows = await env.D1.prepare(
-      "SELECT id, sender_username, msg_type, text, file_id, is_external, created_at, edited_at, deleted_at, reply_to_message_id FROM chat_messages WHERE conversation_id = ? AND created_at > ? ORDER BY created_at ASC LIMIT 50"
+      "SELECT id, sender_username, msg_type, text, file_id, is_external, created_at, edited_at, deleted_at, reply_to_message_id, file_name, file_size FROM chat_messages WHERE conversation_id = ? AND created_at > ? ORDER BY created_at ASC LIMIT 50"
     ).bind(conversationId, parseInt(after, 10) || 0).all();
     const messages = await attachReplyPreviews(env, rows.results || []);
     return json({ messages, groupTitle: conv.title });
@@ -4117,7 +4179,7 @@ async function handleAdminChatMessages(request, env) {
 
   const before = parseInt(url.searchParams.get("before") || "0", 10) || Date.now() + 1;
   const rows = await env.D1.prepare(
-    "SELECT id, sender_username, msg_type, text, file_id, is_external, created_at, edited_at, deleted_at, reply_to_message_id FROM chat_messages WHERE conversation_id = ? AND created_at < ? ORDER BY created_at DESC LIMIT 30"
+    "SELECT id, sender_username, msg_type, text, file_id, is_external, created_at, edited_at, deleted_at, reply_to_message_id, file_name, file_size FROM chat_messages WHERE conversation_id = ? AND created_at < ? ORDER BY created_at DESC LIMIT 30"
   ).bind(conversationId, before).all();
   const messages = await attachReplyPreviews(env, (rows.results || []).slice().reverse());
 
@@ -4937,7 +4999,7 @@ async function handleChatBlockedList(request, env) {
 // تعریف شده تا مجبور نباشیم این رشته‌ی طولانی رو هر جا از نو بنویسیم
 const CHAT_MESSAGE_SELECT_COLUMNS = `
   id, sender_username, msg_type, text, file_id, is_external, created_at, edited_at, deleted_at,
-  reply_to_message_id, pinned_at, pinned_by, forwarded_from,
+  reply_to_message_id, pinned_at, pinned_by, forwarded_from, file_name, file_size,
   (SELECT json_group_array(json_object('emoji', emoji, 'username', username))
    FROM chat_message_reactions WHERE message_id = chat_messages.id) AS reactions_json
 `;
@@ -4966,6 +5028,8 @@ function mapChatMessageRow(m) {
     msgType: m.msg_type,
     text: deleted ? null : m.text,
     fileId: deleted ? null : m.file_id,
+    fileName: deleted ? null : m.file_name || null,
+    fileSize: deleted ? null : m.file_size || null,
     isExternal: !!m.is_external,
     createdAt: m.created_at,
     editedAt: m.edited_at || null,
@@ -4988,7 +5052,7 @@ async function attachReplyPreviews(env, rows) {
 
   const placeholders = replyIds.map(() => "?").join(",");
   const refRows = await env.D1.prepare(
-    `SELECT id, sender_username, msg_type, text, deleted_at FROM chat_messages WHERE id IN (${placeholders})`
+    `SELECT id, sender_username, msg_type, text, deleted_at, file_name FROM chat_messages WHERE id IN (${placeholders})`
   ).bind(...replyIds).all();
   const refMap = {};
   for (const r of refRows.results || []) {
@@ -4997,6 +5061,7 @@ async function attachReplyPreviews(env, rows) {
       sender: r.sender_username,
       msgType: r.msg_type,
       text: r.deleted_at ? null : r.text,
+      fileName: r.deleted_at ? null : r.file_name || null,
       deleted: !!r.deleted_at,
     };
   }
@@ -5092,7 +5157,7 @@ async function notifyChatMembersOfNewMessage(env, conv, conversationId, senderUs
   }
 
   const preview =
-    msgType === "text" ? text : msgType === "image" ? "یه عکس فرستاد" : msgType === "video" ? "یه فیلم فرستاد" : msgType === "audio" ? "یه پیامِ صوتی فرستاد" : "یه استیکر فرستاد";
+    msgType === "text" ? text : msgType === "image" ? "یه عکس فرستاد" : msgType === "video" ? "یه فیلم فرستاد" : msgType === "audio" ? "یه پیامِ صوتی فرستاد" : msgType === "file" ? "یه فایل فرستاد" : "یه استیکر فرستاد";
   for (const row of members.results || []) {
     if (now - (row.last_active_at || 0) < PRESENCE_WINDOW_MS) continue;
     const isMentioned = mentionedUsernames.has(row.username);
@@ -5149,10 +5214,12 @@ async function handleChatSend(request, env) {
     }
   }
 
-  const msgType = ["text", "image", "video", "audio", "sticker"].includes(body.msgType) ? body.msgType : "text";
+  const msgType = ["text", "image", "video", "audio", "file", "sticker"].includes(body.msgType) ? body.msgType : "text";
   let text = null;
   let fileId = null;
   let isExternal = 0;
+  let fileName = null;
+  let fileSize = null;
 
   if (msgType === "text") {
     text = String(body.text || "").trim().slice(0, 2000);
@@ -5180,7 +5247,11 @@ async function handleChatSend(request, env) {
   } else {
     fileId = body.fileId ? String(body.fileId).slice(0, 200) : null;
     if (!fileId) return json({ error: "فایل پیدا نشد؛ اول باید آپلودش کنی" }, 400);
-    if (body.text) text = String(body.text).trim().slice(0, 300) || null; // کپشنِ اختیاری روی عکس/صدا
+    if (body.text) text = String(body.text).trim().slice(0, 300) || null; // کپشنِ اختیاری روی عکس/صدا/فایل
+    if (msgType === "file") {
+      fileName = body.fileName ? String(body.fileName).trim().slice(0, 200) : "فایل";
+      fileSize = Number(body.fileSize) || null;
+    }
   }
 
   // ریپلای اختیاریه: اگه شناسه‌ی یه پیامِ دیگه از همین گفتگو فرستاده باشه، بهش وصل می‌کنیم و پیش‌نمایشش رو
@@ -5208,9 +5279,9 @@ async function handleChatSend(request, env) {
 
   await bind(
     env.D1.prepare(
-      "INSERT INTO chat_messages (id, conversation_id, sender_username, msg_type, text, file_id, is_external, created_at, reply_to_message_id, forwarded_from) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+      "INSERT INTO chat_messages (id, conversation_id, sender_username, msg_type, text, file_id, is_external, created_at, reply_to_message_id, forwarded_from, file_name, file_size) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
     ),
-    [id, conversationId, username, msgType, text, fileId, isExternal, now, replyToId, null]
+    [id, conversationId, username, msgType, text, fileId, isExternal, now, replyToId, null, fileName, fileSize]
   ).run();
   await env.D1.prepare("UPDATE chat_conversations SET last_message_at = ? WHERE id = ?").bind(now, conversationId).run();
   await env.D1.prepare(
@@ -5222,7 +5293,7 @@ async function handleChatSend(request, env) {
   // همون‌جا هم لاگ می‌شه؛ صرفاً یه بک‌آپِ خامِ فقط-خواندنیه، D1 همچنان منبعِ اصلیِ چیزیه که خودِ سایت نشون می‌ده.
   // best-effort‌ه: نبودِ این متغیر یا خطای شبکه نباید جلوی ارسال خودِ پیام رو بگیره
   if (env.CHAT_LOG_CHAT_ID) {
-    const logText = msgType === "text" ? text : msgType === "image" ? "[عکس]" : msgType === "video" ? "[فیلم]" : msgType === "audio" ? "[پیامِ صوتی]" : "[استیکر]";
+    const logText = msgType === "text" ? text : msgType === "image" ? "[عکس]" : msgType === "video" ? "[فیلم]" : msgType === "audio" ? "[پیامِ صوتی]" : msgType === "file" ? `[فایل: ${fileName || ""}]` : "[استیکر]";
     sendTelegramTextTo(env, env.CHAT_LOG_CHAT_ID, `#گفتگو_${conversationId}\n${username}: ${logText}`).catch(() => {});
   }
 
@@ -5235,6 +5306,8 @@ async function handleChatSend(request, env) {
       msgType,
       text,
       fileId,
+      fileName,
+      fileSize,
       isExternal: !!isExternal,
       createdAt: now,
       editedAt: null,
@@ -5504,7 +5577,7 @@ async function handleChatForwardMessage(request, env) {
   if (!sourceMember) return json({ error: "به این گفتگو دسترسی نداری" }, 403);
 
   const original = await env.D1.prepare(
-    "SELECT sender_username, msg_type, text, file_id, is_external, deleted_at FROM chat_messages WHERE id = ? AND conversation_id = ?"
+    "SELECT sender_username, msg_type, text, file_id, is_external, deleted_at, file_name, file_size FROM chat_messages WHERE id = ? AND conversation_id = ?"
   ).bind(messageId, sourceConversationId).first();
   if (!original || original.deleted_at) return json({ error: "پیام پیدا نشد" }, 404);
 
@@ -5522,8 +5595,8 @@ async function handleChatForwardMessage(request, env) {
     const id = `${Date.now()}_${randomHex(4)}`;
     const now = Date.now();
     await env.D1.prepare(
-      "INSERT INTO chat_messages (id, conversation_id, sender_username, msg_type, text, file_id, is_external, created_at, reply_to_message_id, forwarded_from) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
-    ).bind(id, targetConversationId, username, original.msg_type, original.text, original.file_id, original.is_external, now, null, forwardedFromLabel).run();
+      "INSERT INTO chat_messages (id, conversation_id, sender_username, msg_type, text, file_id, is_external, created_at, reply_to_message_id, forwarded_from, file_name, file_size) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+    ).bind(id, targetConversationId, username, original.msg_type, original.text, original.file_id, original.is_external, now, null, forwardedFromLabel, original.file_name || null, original.file_size || null).run();
     await env.D1.prepare("UPDATE chat_conversations SET last_message_at = ? WHERE id = ?").bind(now, targetConversationId).run();
     await env.D1.prepare(
       "UPDATE chat_conversation_members SET last_active_at = ? WHERE conversation_id = ? AND username = ?"
@@ -5677,16 +5750,19 @@ async function handleUploadInit(request, env) {
   const mimeType = (body.mimeType || "").toString();
   const chunkSize = Math.max(CHUNK_UPLOAD_MIN_SIZE, Math.min(CHUNK_UPLOAD_MAX_SIZE, Number(body.chunkSize) || CHUNK_UPLOAD_MIN_SIZE));
 
-  if (!["image", "video", "audio"].includes(kind)) {
+  if (!["image", "video", "audio", "file"].includes(kind)) {
     return json({ error: "نوع فایل نامعتبره" }, 400);
   }
-  const maxSize = kind === "image" ? 8 * 1024 * 1024 : kind === "video" ? 50 * 1024 * 1024 : 15 * 1024 * 1024;
+  const maxSize = kind === "image" ? 8 * 1024 * 1024 : kind === "video" ? 50 * 1024 * 1024 : kind === "file" ? 20 * 1024 * 1024 : 15 * 1024 * 1024;
   if (fileSize <= 0 || fileSize > maxSize) {
     return json({ error: `حجم فایل نباید بیشتر از ${Math.round(maxSize / 1024 / 1024)} مگابایت باشه` }, 400);
   }
-  const typeCheck = kind === "image" ? /^image\// : kind === "video" ? /^video\// : /^audio\//;
-  if (!typeCheck.test(mimeType)) {
-    return json({ error: "نوع فایل با دسته‌ی انتخابی مطابقت نداره" }, 400);
+  // برای «file» (سند/زیپ/pdf و...) هیچ محدودیتِ نوعِ MIMEای اعمال نمی‌شه؛ هر نوع فایلی مجازه
+  if (kind !== "file") {
+    const typeCheck = kind === "image" ? /^image\// : kind === "video" ? /^video\// : /^audio\//;
+    if (!typeCheck.test(mimeType)) {
+      return json({ error: "نوع فایل با دسته‌ی انتخابی مطابقت نداره" }, 400);
+    }
   }
 
   const totalChunks = Math.max(1, Math.ceil(fileSize / chunkSize));
@@ -5783,6 +5859,8 @@ async function handleUploadComplete(request, env) {
   const body = await request.json().catch(() => ({}));
   const uploadId = (body.uploadId || "").toString();
   if (!uploadId) return json({ error: "درخواستِ نامعتبر" }, 400);
+  // اسمِ اصلیِ فایل فقط برای kind === "file" معنی داره (سند/زیپ/pdf و...)؛ برای بقیه‌ی انواع نادیده گرفته می‌شه
+  const clientFileName = body.fileName ? String(body.fileName).trim().slice(0, 200) : null;
 
   const manifest = await getChunkedUploadManifest(env, username, uploadId);
   if (!manifest) return json({ error: "این جلسه‌ی آپلود پیدا نشد یا منقضی شده" }, 404);
@@ -5826,7 +5904,7 @@ async function handleUploadComplete(request, env) {
       offset += bytes.byteLength;
     }
 
-    const fileName = manifest.kind === "image" ? "upload.jpg" : manifest.kind === "video" ? "upload.mp4" : "upload.mp3";
+    const fileName = manifest.kind === "image" ? "upload.jpg" : manifest.kind === "video" ? "upload.mp4" : manifest.kind === "file" ? (clientFileName || "file") : "upload.mp3";
     // از Blob به‌جای File استفاده می‌کنیم: سازنده‌ی File توی بعضی نسخه‌های ران‌تایمِ ورکرها به‌طورِ
     // کامل در دسترس نیست و باعثِ خطای بی‌صداتر می‌شد (که فقط تویِ لاگِ سرور دیده می‌شد، نه پیغامِ
     // دقیق برای کاربر). Blob همه‌جا پشتیبانی می‌شه؛ فقط چون sendTelegramFile از file.name برای
@@ -5871,6 +5949,10 @@ async function handleUploadComplete(request, env) {
     } else if (manifest.kind === "video") {
       const result = await sendTelegramFileWithRetry(env, "sendVideo", "video", file, undefined);
       fileId = extractFileId("video", result);
+      messageId = result.message_id || null;
+    } else if (manifest.kind === "file") {
+      const result = await sendTelegramFileWithRetry(env, "sendDocument", "document", file, undefined);
+      fileId = extractFileId("document", result);
       messageId = result.message_id || null;
     } else {
       const result = await sendTelegramFileWithRetry(env, "sendAudio", "audio", file, undefined);
@@ -6252,6 +6334,9 @@ async function routeRequest(url, request, env, ctx) {
       }
       if (url.pathname === "/api/post" && request.method === "DELETE") {
         return await handleDeletePost(request, env);
+      }
+      if (url.pathname === "/api/post/edit" && request.method === "POST") {
+        return await handleEditPost(request, env);
       }
       if (url.pathname === "/api/post/pin" && request.method === "POST") {
         return await handlePinPost(request, env);
