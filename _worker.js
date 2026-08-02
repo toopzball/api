@@ -5587,9 +5587,57 @@ async function handleChatRead(request, env) {
 //   );
 //   CREATE INDEX IF NOT EXISTS idx_chunked_upload_parts_upload ON chunked_upload_parts (upload_id);
 
-// اندازه‌ی هر تکه از سمتِ سرور محدود می‌شه تا زیرِ سقفِ اندازه‌ی هر ستونِ D1 بمونه
+// اندازه‌ی هر تکه از سمتِ سرور محدود می‌شه تا زیرِ سقفِ اندازه‌ی هر ستونِ D1 بمونه.
+// نکته‌ی مهم (که قبلاً باعثِ کندی و شکنندگیِ آپلود می‌شد): سقفِ واقعیِ D1 برای هر ردیف/BLOB
+// حدودِ ۲ مگابایته، و مهم‌تر از اون، هر invocationِ ورکر فقط تا ۵۰ subrequest (پلنِ رایگان) یا
+// ۱۰۰۰ تا (پلنِ پولی) می‌تونه به D1/بیرون بزنه. با چانکِ ۷۰۰ کیلوبایتیِ قدیم، یه ویدیوی ۵۰
+// مگابایتی می‌شد ~۷۲ تکه — که مرحله‌ی «تکمیل» (merge کردنِ تکه‌ها) به‌تنهایی ۷۲ تا کوئریِ D1 توی
+// یه invocation می‌زد و رویِ پلنِ رایگان مستقیماً به سقفِ subrequest می‌خورد و شکست می‌خورد، بدونِ
+// اینکه پیغامِ خطا این علتِ واقعی رو نشون بده. حالا با چانکِ ۱.۵ مگابایتی، همون ویدیو ~۳۴ تکه می‌شه:
+// هم تعدادِ درخواست‌ها (و درنتیجه سربارِ رفت‌وبرگشتِ شبکه) تقریباً نصف می‌شه، هم مرحله‌ی تکمیل
+// همیشه زیرِ سقفِ ۵۰ subrequest می‌مونه.
 const CHUNK_UPLOAD_MIN_SIZE = 256 * 1024;
-const CHUNK_UPLOAD_MAX_SIZE = 768 * 1024;
+const CHUNK_UPLOAD_MAX_SIZE = 1536 * 1024;
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+// ---------- اجرای موازیِ محدود (concurrency pool) ----------
+// چرا: قبلاً موقعِ چسبوندنِ تکه‌ها (merge)، هر تکه با یه await سرتاسری و پشتِ‌سرِهم از D1 خونده
+// می‌شد؛ برای فایل‌های چندتکه‌ای این یعنی جمعِ تأخیرِ رفت‌وبرگشتِ تک‌تکِ کوئری‌ها. حالا چند تا
+// کوئری هم‌زمان (نه همه‌ی‌شون با هم، برای اینکه به D1 فشار نیاد) اجرا می‌شن.
+async function mapWithConcurrency(items, limit, worker) {
+  const results = new Array(items.length);
+  let nextIndex = 0;
+  async function runNext() {
+    while (nextIndex < items.length) {
+      const i = nextIndex++;
+      results[i] = await worker(items[i], i);
+    }
+  }
+  const workers = Array.from({ length: Math.min(limit, items.length) }, () => runNext());
+  await Promise.all(workers);
+  return results;
+}
+
+// ---------- فرستادنِ فایل به تلگرام با چندبار تلاش ----------
+// چرا: خودِ sendTelegramFile قبلاً فقط یه‌بار امتحان می‌شد؛ اگه همون یه درخواست به تلگرام (که
+// می‌تونه چندین مگابایت باشه) به‌خاطرِ یه قطعیِ گذرا شکست می‌خورد، کلِ آپلود شکست می‌خورد با اینکه
+// فایل کاملاً رویِ سرورِ ما آماده بود. حالا چندبار (با فاصله‌ی کوتاه، و هر بار با شانسِ انتخابِ باتِ
+// دیگه چون pickTelegramBot خودش تصادفیه) امتحان می‌شه.
+async function sendTelegramFileWithRetry(env, method, field, file, caption, extraFields = {}, attempts = 3) {
+  let lastErr = null;
+  for (let i = 0; i < attempts; i++) {
+    try {
+      return await sendTelegramFile(env, method, field, file, caption, extraFields);
+    } catch (err) {
+      lastErr = err;
+      if (i < attempts - 1) await sleep(500 * (i + 1));
+    }
+  }
+  throw lastErr;
+}
 
 // پاک‌سازیِ فرصت‌طلبانه‌ی جلسه‌های رهاشده (بدونِ نیازِ کرون جدا): هر بار init صدا زده بشه، با
 // احتمالِ کم یه پاک‌سازیِ جلسه‌های قدیمی‌تر از ۲۴ ساعت هم انجام می‌شه
@@ -5742,34 +5790,35 @@ async function handleUploadComplete(request, env) {
   // این بخش (خوندنِ تکه‌ها از D1 و چسبوندنشون به هم) قبلاً با یه SELECT بزرگ همه‌ی تکه‌ها رو با هم
   // می‌خوند. برای فایل‌های کوچیکِ چت (۱-۲ تکه) مشکلی نداشت، ولی برای فایل‌های بزرگ‌تر مثل یه آهنگِ
   // کامل (۲۰+ تکه، رویِ هم چندین مگابایت) به سقفِ اندازه‌ی پاسخِ یه‌کوئریِ D1 می‌خورد و کل درخواست
-  // شکست می‌خورد. حالا هر تکه رو جدا می‌خونیم و پشتِ‌سرِهم می‌چسبونیم — هم امن‌تره، هم اگه یه تکه‌ی
-  // خاص مشکل داشته باشه، دقیقاً همون رو (با شماره‌اش) تو لاگ و پیغامِ خطا مشخص می‌کنه.
+  // شکست می‌خورد. به‌جاش هر تکه جدا خونده می‌شه — هم امن‌تره، هم اگه یه تکه‌ی خاص مشکل داشته باشه،
+  // دقیقاً همون رو (با شماره‌اش) تو لاگ و پیغامِ خطا مشخص می‌کنه. تنها فرقِ الان با قبل اینه که
+  // به‌جایِ یکی‌یکی و پشتِ‌سرِهم (که برایِ فایل‌هایِ چندتکه‌ای جمعِ کندیِ رفت‌وبرگشتِ هر کوئری رو
+  // روی هم می‌ذاشت)، چندتا کوئری هم‌زمان اجرا می‌شن (مثلِ قبل، همچنان زیرِ سقفِ subrequestِ ورکر،
+  // چون تعدادِ کلِ تکه‌ها با چانکِ بزرگ‌ترِ جدید خیلی کمتره) — همون نتیجه، به‌طورِ محسوسی سریع‌تر.
   let file;
   try {
     const totalChunks = manifest.total_chunks;
-    const chunkBuffers = [];
-    let totalSize = 0;
-    for (let i = 0; i < totalChunks; i++) {
+    const indices = Array.from({ length: totalChunks }, (_, i) => i);
+    const chunkBuffers = await mapWithConcurrency(indices, 6, async (i) => {
       const row = await env.D1.prepare("SELECT data FROM chunked_upload_parts WHERE upload_id = ? AND chunk_index = ?").bind(uploadId, i).first();
       if (!row || row.data == null) {
-        return json({ error: `تکه‌ی ${i + 1} از ${totalChunks} پیدا نشد؛ آپلود کامل نیست، دوباره امتحان کن` }, 409);
+        throw new Error(`MISSING_CHUNK:${i}`);
       }
       // نکته‌ی مهم: چک‌کردنِ نوعِ دیتا با «instanceof ArrayBuffer» غیرقابل‌اعتماده، چون دیتایی که از
       // D1 برمی‌گرده ممکنه از یه «رِلمِ» جاوااسکریپتیِ دیگه باشه (مثلاً از داخلِ خودِ ران‌تایمِ ورکر)،
       // و instanceof بینِ رِلم‌های مختلف درست کار نمی‌کنه حتی اگه واقعاً ArrayBuffer باشه. به‌جاش
       // مستقیم سعی می‌کنیم بسازیمش با new Uint8Array(...) که کاملاً ساختاری کار می‌کنه و به رِلم
       // وابسته نیست؛ اگه واقعاً خراب باشه همینجا خطا می‌ده و می‌فهمیم.
-      let bytes;
       try {
-        bytes = row.data instanceof Uint8Array ? row.data : new Uint8Array(row.data);
+        return row.data instanceof Uint8Array ? row.data : new Uint8Array(row.data);
       } catch (convErr) {
         console.error(`تبدیلِ دیتای تکه‌ی شماره‌ی ${i} به بایت ناموفق بود:`, convErr && convErr.message, "typeof:", typeof row.data);
-        return json({ error: `تکه‌ی ${i + 1} خراب بود؛ دوباره امتحان کن` }, 409);
+        throw new Error(`CORRUPT_CHUNK:${i}`);
       }
-      chunkBuffers.push(bytes);
-      totalSize += bytes.byteLength;
-    }
+    });
 
+    let totalSize = 0;
+    for (const bytes of chunkBuffers) totalSize += bytes.byteLength;
     const merged = new Uint8Array(totalSize);
     let offset = 0;
     for (const bytes of chunkBuffers) {
@@ -5786,6 +5835,15 @@ async function handleUploadComplete(request, env) {
     Object.defineProperty(mergedBlob, "name", { value: fileName, writable: false });
     file = mergedBlob;
   } catch (err) {
+    const msg = (err && err.message) || "";
+    const missingMatch = msg.match(/^(MISSING|CORRUPT)_CHUNK:(\d+)$/);
+    if (missingMatch) {
+      const label = missingMatch[1] === "MISSING" ? "پیدا نشد" : "خراب بود";
+      console.error(`خطای چسبوندنِ تکه‌های آپلود به هم: تکه‌ی شماره‌ی ${missingMatch[2]} ${label}`);
+      // تکه‌های ذخیره‌شده واقعاً ناقص/خراب‌ان، نگه‌داشتنشون فایده‌ای نداره؛ کاربر باید از اول شروع کنه
+      await deleteChunkedUploadRows(env, uploadId);
+      return json({ error: `تکه‌ی ${Number(missingMatch[2]) + 1} از ${manifest.total_chunks} ${label}؛ آپلود کامل نیست، دوباره امتحان کن` }, 409);
+    }
     console.error("خطای چسبوندنِ تکه‌های آپلود به هم:", err && err.message, err && err.stack);
     await deleteChunkedUploadRows(env, uploadId);
     return json({ error: "چسبوندنِ تکه‌های فایل به هم ناموفق بود، دوباره امتحان کن" }, 502);
@@ -5796,28 +5854,35 @@ async function handleUploadComplete(request, env) {
     return json({ error: "محتوای فایل با نوع اعلام‌شده‌اش مطابقت نداره" }, 400);
   }
 
+  // نکته‌ی مهمِ پایداری: قبلاً این بخش، صرف‌نظر از موفقیت/شکستِ فرستادن به تلگرام، همیشه (تویِ finally)
+  // تکه‌های ذخیره‌شده رو پاک می‌کرد. یعنی اگه فرستادن به تلگرام به‌خاطرِ یه قطعیِ گذرا شکست می‌خورد
+  // (که رویِ اینترنتِ ناپایدار خیلی محتمله)، فایلی که کاربر با زحمت و صبر تکه‌تکه آپلود کرده بود
+  // (که می‌تونست چند مگابایت باشه) کاملاً از دست می‌رفت و باید از صفر آپلود می‌شد. حالا تکه‌ها فقط
+  // وقتی پاک می‌شن که یا واقعاً موفق بشیم، یا خودِ فایل به‌طورِ ذاتی خراب/نامعتبر باشه؛ برای خطاهای
+  // گذرای تلگرام، تکه‌ها دست‌نخورده می‌مونن تا با یه تلاشِ دیگه‌ی /api/upload/complete (بدونِ نیازِ
+  // به آپلودِ دوباره‌ی خودِ فایل) کامل بشه.
   let fileId = null;
   let messageId = null;
   try {
     if (manifest.kind === "image") {
-      const result = await sendTelegramFile(env, "sendPhoto", "photo", file, undefined);
+      const result = await sendTelegramFileWithRetry(env, "sendPhoto", "photo", file, undefined);
       fileId = extractFileId("photo", result);
       messageId = result.message_id || null;
     } else if (manifest.kind === "video") {
-      const result = await sendTelegramFile(env, "sendVideo", "video", file, undefined);
+      const result = await sendTelegramFileWithRetry(env, "sendVideo", "video", file, undefined);
       fileId = extractFileId("video", result);
       messageId = result.message_id || null;
     } else {
-      const result = await sendTelegramFile(env, "sendAudio", "audio", file, undefined);
+      const result = await sendTelegramFileWithRetry(env, "sendAudio", "audio", file, undefined);
       fileId = extractFileId("audio", result);
       messageId = result.message_id || null;
     }
   } catch (err) {
-    console.error("خطای تکمیلِ آپلودِ استیج‌بندی‌شده:", err);
-    return json({ error: "آپلود ناموفق بود، دوباره امتحان کن" }, 502);
-  } finally {
-    await deleteChunkedUploadRows(env, uploadId);
+    console.error("خطای تکمیلِ آپلودِ استیج‌بندی‌شده (تلگرام):", err && err.message);
+    return json({ error: "ارسال به تلگرام ناموفق بود؛ فایل رویِ سرور محفوظه، دوباره امتحان کن" }, 502);
   }
+
+  await deleteChunkedUploadRows(env, uploadId);
 
   if (!fileId) return json({ error: "دریافت فایل از تلگرام ناموفق بود" }, 502);
   // پستِ اصلی (handlePost) این fileId/messageId رو مستقیماً استفاده می‌کنه تا مجبور نباشه فایل رو
