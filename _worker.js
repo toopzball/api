@@ -7183,26 +7183,33 @@ export default {
     const url = new URL(request.url);
     const corsHeaders = corsHeadersFor(request);
 
+    // پیش‌درخواستِ CORS (OPTIONS) همیشه، حتی برای Originهای غیرمجاز، باید با کدِ ۲xx جواب داده بشه؛
+    // این خودِ مرورگره که بر اساسِ هدرهای CORS توی همین پاسخ تصمیم می‌گیره درخواستِ اصلی رو بفرسته یا
+    // نه. اگه اینجا (مثلِ قبل) قبل از OPTIONS، گیتِ دسترسیِ مستقیم رو چک کنیم و برای پیش‌درخواست ۴۰۳
+    // برگردونیم، مرورگر اصلاً کدِ وضعیت رو نمی‌بینه و کلِ درخواست رو به‌عنوانِ یه خطای شبکه (چیزی که
+    // توی کدِ فرانت‌اند مثلِ "Failed to fetch" دیده می‌شه) گزارش می‌ده؛ محدودیتِ واقعیِ دسترسی باید
+    // فقط رویِ خودِ درخواستِ اصلی (POST/GET/...) اعمال بشه، نه رویِ پیش‌درخواست.
+    if (request.method === "OPTIONS") {
+      return new Response(null, { headers: corsHeaders });
+    }
+
     // این ورکر دیگه نباید مستقیم صدا زده بشه؛ فقط از طریق ورکر پروکسیِ جلوش. پروکسی یه هدر
     // مخفی مشترک (X-Internal-Key) اضافه می‌کنه که فقط بین دو ورکر شناخته‌شده‌ست. یه استثنا هم
-    // داریم: وقتی فرانت‌اند از پشتِ GitHub Pages سرو می‌شه (که نمی‌تونه پروکسی/فانکشن اجرا کنه)،
-    // درخواست‌های مستقیم از همون Originِ شناخته‌شده (dehaat.bbboi.ir) هم مجازن — بدونِ نیاز به کلید.
-    // اگه هیچ‌کدوم از این دو شرط برقرار نبود (یعنی درخواست مستقیم از curl/Postman/جای ناشناس اومده)، رد می‌شه.
-    const DIRECT_ALLOWED_ORIGINS = ["https://dehaat.bbboi.ir"];
+    // داریم: دکمه‌ی «آپلود با گیت‌هاب» توی فرانت‌اند به کاربر اجازه می‌ده صراحتاً همین مسیرِ مستقیم رو
+    // انتخاب کنه (چه از پشتِ GitHub Pages وارد شده باشه که اصلاً پروکسی نداره، چه از دامنه‌ی دیگه‌ای
+    // بخواد پروکسی رو دور بزنه)؛ برای همین، هر Originِ شناخته‌شده‌ی خودِ سایت (همون لیستِ
+    // ALLOWED_ORIGINS بالا) بدونِ نیاز به کلید مجازه. اگه هیچ‌کدوم از این دو شرط برقرار نبود (یعنی
+    // درخواست مستقیم از curl/Postman/جای ناشناس اومده)، رد می‌شه.
     const requestOrigin = request.headers.get("Origin");
     const internalKey = request.headers.get("X-Internal-Key");
     const hasValidInternalKey = env.INTERNAL_KEY && internalKey === env.INTERNAL_KEY;
-    const isAllowedDirectOrigin = requestOrigin && DIRECT_ALLOWED_ORIGINS.includes(requestOrigin);
+    const isAllowedDirectOrigin = requestOrigin && ALLOWED_ORIGINS.includes(requestOrigin);
     if (!hasValidInternalKey && !isAllowedDirectOrigin) {
       const denied = json({ error: "دسترسی مستقیم مجاز نیست" }, 403);
       for (const [key, value] of Object.entries(corsHeaders)) {
         denied.headers.set(key, value);
       }
       return denied;
-    }
-
-    if (request.method === "OPTIONS") {
-      return new Response(null, { headers: corsHeaders });
     }
 
     try {
