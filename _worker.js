@@ -6690,6 +6690,32 @@ async function routeRequest(url, request, env, ctx) {
           return await handleChannelDetails(request, env, channelId);
         }
       }
+      if (url.pathname === "/api/playlist/create" && request.method === "POST") {
+        return await handleCreatePlaylist(request, env);
+      }
+      if (url.pathname === "/api/playlist/update" && request.method === "POST") {
+        return await handleUpdatePlaylist(request, env);
+      }
+      if (url.pathname === "/api/playlist/delete" && request.method === "POST") {
+        return await handleDeletePlaylist(request, env);
+      }
+      if (url.pathname === "/api/playlists" && request.method === "GET") {
+        return await handleListPlaylists(request, env);
+      }
+      if (url.pathname === "/api/playlist/add-track" && request.method === "POST") {
+        return await handleAddTrackToPlaylist(request, env);
+      }
+      if (url.pathname === "/api/playlist/remove-track" && request.method === "POST") {
+        return await handleRemoveTrackFromPlaylist(request, env);
+      }
+      if (url.pathname === "/api/playlist/for-track" && request.method === "GET") {
+        return await handlePlaylistsForTrack(request, env);
+      }
+      // مسیر پویا: /api/playlist/:id/tracks
+      if (url.pathname.startsWith("/api/playlist/") && url.pathname.endsWith("/tracks") && request.method === "GET") {
+        const playlistId = decodeURIComponent(url.pathname.slice("/api/playlist/".length, -"/tracks".length));
+        return await handlePlaylistTracks(request, env, playlistId);
+      }
       return json({ error: "مسیر پیدا نشد" }, 404);
 }
 
@@ -7258,6 +7284,210 @@ async function handleSearchRooms(request, env) {
   ];
 
   return json({ results, hasMore: results.length >= limit, page });
+}
+
+// #endregion
+// #region پلی‌لیست‌های سگ‌تونز
+// ---------- پلی‌لیست‌ها ----------
+// جدول‌های موردنیاز (یک‌بار توی کنسولِ D1 اجرا شه):
+//   CREATE TABLE IF NOT EXISTS playlists (
+//     id TEXT PRIMARY KEY,
+//     owner_username TEXT NOT NULL,
+//     name TEXT NOT NULL,
+//     is_public INTEGER NOT NULL DEFAULT 0,
+//     created_at INTEGER NOT NULL,
+//     updated_at INTEGER NOT NULL
+//   );
+//   CREATE INDEX IF NOT EXISTS idx_playlists_owner ON playlists (owner_username);
+//   CREATE TABLE IF NOT EXISTS playlist_items (
+//     playlist_id TEXT NOT NULL,
+//     post_id TEXT NOT NULL,
+//     added_at INTEGER NOT NULL,
+//     position INTEGER NOT NULL,
+//     PRIMARY KEY (playlist_id, post_id)
+//   );
+//   CREATE INDEX IF NOT EXISTS idx_playlist_items_playlist ON playlist_items (playlist_id, position);
+
+const PLAYLIST_PAGE_SIZE = 30;
+const PLAYLIST_TRACK_PAGE_SIZE = 30;
+
+// فقط اگه مالکِ پلی‌لیست خودِ کاربر باشه رکوردش رو برمی‌گردونه، وگرنه خطای مناسب
+async function getPlaylistOwned(env, playlistId, username) {
+  const pl = await env.D1.prepare("SELECT * FROM playlists WHERE id = ?").bind(playlistId).first();
+  if (!pl) return { error: json({ error: "پلی‌لیست پیدا نشد" }, 404) };
+  if (pl.owner_username !== username) return { error: json({ error: "این پلی‌لیست مالِ تو نیست" }, 403) };
+  return { playlist: pl };
+}
+
+// ---------- ساختِ پلی‌لیست ----------
+async function handleCreatePlaylist(request, env) {
+  const username = await getUserFromToken(request, env);
+  if (!username) return json({ error: "ابتدا وارد شو" }, 401);
+  const body = await request.json().catch(() => ({}));
+  const name = (body.name || "").toString().trim().slice(0, 60);
+  if (!name) return json({ error: "اسم پلی‌لیست لازمه" }, 400);
+  const isPublic = body.is_public ? 1 : 0;
+  const now = Date.now();
+  const id = `pl_${now}_${randomHex(4)}`;
+  await env.D1.prepare(
+    "INSERT INTO playlists (id, owner_username, name, is_public, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)"
+  ).bind(id, username, name, isPublic, now, now).run();
+  return json({
+    ok: true,
+    playlist: { id, owner_username: username, name, is_public: isPublic, created_at: now, updated_at: now, track_count: 0 },
+  });
+}
+
+// ---------- ویرایشِ پلی‌لیست (تغییرِ اسم و/یا عمومی↔خصوصی) ----------
+async function handleUpdatePlaylist(request, env) {
+  const username = await getUserFromToken(request, env);
+  if (!username) return json({ error: "ابتدا وارد شو" }, 401);
+  const body = await request.json().catch(() => ({}));
+  const playlistId = (body.playlist_id || "").toString();
+  if (!playlistId) return json({ error: "شناسه پلی‌لیست لازمه" }, 400);
+  const { error } = await getPlaylistOwned(env, playlistId, username);
+  if (error) return error;
+
+  const updates = [];
+  const params = [];
+  if (typeof body.name === "string" && body.name.trim()) {
+    updates.push("name = ?");
+    params.push(body.name.trim().slice(0, 60));
+  }
+  if (typeof body.is_public !== "undefined") {
+    updates.push("is_public = ?");
+    params.push(body.is_public ? 1 : 0);
+  }
+  if (updates.length === 0) return json({ error: "چیزی برای تغییر نیست" }, 400);
+  updates.push("updated_at = ?");
+  params.push(Date.now(), playlistId);
+  await env.D1.prepare(`UPDATE playlists SET ${updates.join(", ")} WHERE id = ?`).bind(...params).run();
+  return json({ ok: true });
+}
+
+// ---------- حذفِ پلی‌لیست ----------
+async function handleDeletePlaylist(request, env) {
+  const username = await getUserFromToken(request, env);
+  if (!username) return json({ error: "ابتدا وارد شو" }, 401);
+  const body = await request.json().catch(() => ({}));
+  const playlistId = (body.playlist_id || "").toString();
+  if (!playlistId) return json({ error: "شناسه پلی‌لیست لازمه" }, 400);
+  const { error } = await getPlaylistOwned(env, playlistId, username);
+  if (error) return error;
+  await env.D1.batch([
+    env.D1.prepare("DELETE FROM playlist_items WHERE playlist_id = ?").bind(playlistId),
+    env.D1.prepare("DELETE FROM playlists WHERE id = ?").bind(playlistId),
+  ]);
+  return json({ ok: true });
+}
+
+// ---------- لیستِ پلی‌لیست‌ها: یا پلی‌لیست‌های خودِ کاربر (خصوصی+عمومی)، یا همه‌ی عمومی‌های سایت ----------
+async function handleListPlaylists(request, env) {
+  const username = await getUserFromToken(request, env);
+  if (!username) return json({ error: "ابتدا وارد شو" }, 401);
+  const url = new URL(request.url);
+  const scope = url.searchParams.get("scope") || "mine"; // mine | public
+  const page = Math.max(parseInt(url.searchParams.get("page") || "1", 10), 1);
+  const pageSize = PLAYLIST_PAGE_SIZE;
+  const offset = (page - 1) * pageSize;
+
+  const whereSql = scope === "public" ? "WHERE is_public = 1" : "WHERE owner_username = ?";
+  const params = scope === "public" ? [] : [username];
+
+  const countRow = await env.D1.prepare(`SELECT COUNT(*) as c FROM playlists ${whereSql}`).bind(...params).first();
+  const rows = await env.D1.prepare(
+    `SELECT playlists.*, (SELECT COUNT(*) FROM playlist_items WHERE playlist_items.playlist_id = playlists.id) AS track_count
+     FROM playlists ${whereSql} ORDER BY updated_at DESC LIMIT ? OFFSET ?`
+  ).bind(...params, pageSize, offset).all();
+
+  const total = countRow?.c || 0;
+  return json({ ok: true, playlists: rows.results || [], hasMore: offset + (rows.results || []).length < total });
+}
+
+// ---------- آهنگ‌های داخلِ یه پلی‌لیست (تازه‌اضافه‌شده‌ها بالاتر) ----------
+async function handlePlaylistTracks(request, env, playlistId) {
+  const username = await getUserFromToken(request, env);
+  if (!username) return json({ error: "ابتدا وارد شو" }, 401);
+  const playlist = await env.D1.prepare("SELECT * FROM playlists WHERE id = ?").bind(playlistId).first();
+  if (!playlist) return json({ error: "پلی‌لیست پیدا نشد" }, 404);
+  if (!playlist.is_public && playlist.owner_username !== username) {
+    return json({ error: "این پلی‌لیست خصوصیه" }, 403);
+  }
+
+  const url = new URL(request.url);
+  const page = Math.max(parseInt(url.searchParams.get("page") || "1", 10), 1);
+  const pageSize = PLAYLIST_TRACK_PAGE_SIZE;
+  const offset = (page - 1) * pageSize;
+
+  const countRow = await env.D1.prepare("SELECT COUNT(*) as c FROM playlist_items WHERE playlist_id = ?").bind(playlistId).first();
+  const rows = await env.D1.prepare(
+    `SELECT posts.* FROM playlist_items
+     JOIN posts ON posts.id = playlist_items.post_id
+     WHERE playlist_items.playlist_id = ?
+     ORDER BY playlist_items.position DESC LIMIT ? OFFSET ?`
+  ).bind(playlistId, pageSize, offset).all();
+
+  const total = countRow?.c || 0;
+  return json({
+    ok: true,
+    playlist,
+    posts: rows.results || [],
+    hasMore: offset + (rows.results || []).length < total,
+  });
+}
+
+// ---------- افزودنِ یه آهنگ به پلی‌لیست ----------
+async function handleAddTrackToPlaylist(request, env) {
+  const username = await getUserFromToken(request, env);
+  if (!username) return json({ error: "ابتدا وارد شو" }, 401);
+  const body = await request.json().catch(() => ({}));
+  const playlistId = (body.playlist_id || "").toString();
+  const postId = (body.post_id || "").toString();
+  if (!playlistId || !postId) return json({ error: "اطلاعات ناقصه" }, 400);
+  const { error } = await getPlaylistOwned(env, playlistId, username);
+  if (error) return error;
+
+  const post = await env.D1.prepare("SELECT id FROM posts WHERE id = ? AND type = 'audio'").bind(postId).first();
+  if (!post) return json({ error: "آهنگ پیدا نشد" }, 404);
+
+  const now = Date.now();
+  await env.D1.prepare(
+    "INSERT OR IGNORE INTO playlist_items (playlist_id, post_id, added_at, position) VALUES (?, ?, ?, ?)"
+  ).bind(playlistId, postId, now, now).run();
+  await env.D1.prepare("UPDATE playlists SET updated_at = ? WHERE id = ?").bind(now, playlistId).run();
+  return json({ ok: true });
+}
+
+// ---------- حذفِ یه آهنگ از پلی‌لیست ----------
+async function handleRemoveTrackFromPlaylist(request, env) {
+  const username = await getUserFromToken(request, env);
+  if (!username) return json({ error: "ابتدا وارد شو" }, 401);
+  const body = await request.json().catch(() => ({}));
+  const playlistId = (body.playlist_id || "").toString();
+  const postId = (body.post_id || "").toString();
+  if (!playlistId || !postId) return json({ error: "اطلاعات ناقصه" }, 400);
+  const { error } = await getPlaylistOwned(env, playlistId, username);
+  if (error) return error;
+
+  await env.D1.prepare("DELETE FROM playlist_items WHERE playlist_id = ? AND post_id = ?").bind(playlistId, postId).run();
+  return json({ ok: true });
+}
+
+// ---------- برای مودالِ «افزودن به پلی‌لیست»: پلی‌لیست‌های خودِ کاربر + این‌که کدوم‌ها همین آهنگ رو دارن ----------
+async function handlePlaylistsForTrack(request, env) {
+  const username = await getUserFromToken(request, env);
+  if (!username) return json({ error: "ابتدا وارد شو" }, 401);
+  const url = new URL(request.url);
+  const postId = (url.searchParams.get("post_id") || "").toString();
+  if (!postId) return json({ error: "شناسه آهنگ لازمه" }, 400);
+
+  const rows = await env.D1.prepare(
+    `SELECT playlists.id, playlists.name, playlists.is_public,
+            EXISTS(SELECT 1 FROM playlist_items WHERE playlist_items.playlist_id = playlists.id AND playlist_items.post_id = ?) AS has_track
+     FROM playlists WHERE owner_username = ? ORDER BY updated_at DESC`
+  ).bind(postId, username).all();
+
+  return json({ ok: true, playlists: rows.results || [] });
 }
 
 // #endregion
