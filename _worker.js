@@ -3494,6 +3494,7 @@ async function handleUserSearch(request, env) {
 // #region پروفایل عمومیِ یک کاربر
 // یادداشت مایگریشن (یه‌بار توی D1 Console اجرا شه):
 //   ALTER TABLE profiles ADD COLUMN banner_file_id TEXT;
+//   ALTER TABLE profiles ADD COLUMN chat_bg_file_id TEXT;
 async function handleGetProfile(request, env) {
   const url = new URL(request.url);
   const username = url.searchParams.get("username");
@@ -3529,6 +3530,7 @@ async function handleGetProfile(request, env) {
       bio: (profile && profile.bio) || "",
       avatar_file_id: (profile && profile.avatar_file_id) || null,
       banner_file_id: (profile && profile.banner_file_id) || null,
+      chat_bg_file_id: (profile && profile.chat_bg_file_id) || null,
       theme: normalizeThemeValue((profile && profile.theme) || "purple-dark"),
       total_upvotes: (totals && totals.totalUpvotes) || 0,
       total_likes: (totals && totals.totalLikes) || 0,
@@ -3644,6 +3646,62 @@ async function handleUpdateProfile(request, env) {
   ).bind(username, bio, avatarFileId, bannerFileId, theme, Date.now()).run();
 
   return json({ ok: true, profile: { username, bio, avatar_file_id: avatarFileId, banner_file_id: bannerFileId, theme } });
+}
+
+// #endregion
+// #region پس‌زمینه‌ی چت (یه عکسِ مشترک برای همه‌ی چت‌ها/گروه‌های کاربر)
+// ---------- آپلود/جایگزینیِ پس‌زمینه‌ی چت ----------
+// عکس از سمتِ کلاینت از قبل با نسبتِ صفحه‌ی دیوایسِ خودش کراپ شده؛ اینجا فقط اعتبارسنجی و ذخیره می‌کنیم.
+async function handleUpdateChatBg(request, env) {
+  const username = await getUserFromToken(request, env);
+  if (!username) return json({ error: "ابتدا وارد شو" }, 401);
+
+  const form = await request.formData();
+  const bgFile = form.get("chat_bg");
+  if (!bgFile || typeof bgFile === "string" || bgFile.size === 0) {
+    return json({ error: "عکسی ارسال نشده" }, 400);
+  }
+  if (!bgFile.type.startsWith("image/")) {
+    return json({ error: "پس‌زمینه باید یه فایل عکس باشه" }, 400);
+  }
+  if (!(await verifyFileMatchesCategory(bgFile, "image"))) {
+    return json({ error: "محتوای فایل با نوع اعلام‌شده‌اش مطابقت نداره" }, 400);
+  }
+  if (bgFile.size > 8 * 1024 * 1024) {
+    return json({ error: "حجم عکسِ پس‌زمینه نباید بیشتر از ۸ مگابایت باشه" }, 400);
+  }
+  if (!(await checkRateLimit(env, "chatbg_upload", username, 10, 600))) {
+    return json({ error: "آپدیت پس‌زمینه زیاد بوده، چند دقیقه دیگه امتحان کن" }, 429);
+  }
+
+  let chatBgFileId;
+  try {
+    const result = await sendTelegramFile(env, "sendPhoto", "photo", bgFile, `پس‌زمینه‌ی چت جدید — ${username}`);
+    chatBgFileId = extractFileId("photo", result);
+  } catch (err) {
+    console.error("خطای آپلود پس‌زمینه‌ی چت به تلگرام:", err);
+    return json({ error: "آپلود پس‌زمینه ناموفق بود، دوباره امتحان کن" }, 502);
+  }
+
+  const existing = await env.D1.prepare("SELECT * FROM profiles WHERE username = ?").bind(username).first();
+  const theme = normalizeThemeValue((existing && existing.theme) || "purple-dark");
+  await env.D1.prepare(
+    `INSERT INTO profiles (username, bio, avatar_file_id, banner_file_id, chat_bg_file_id, theme, updated_at) VALUES (?, '', NULL, NULL, ?, ?, ?)
+     ON CONFLICT(username) DO UPDATE SET chat_bg_file_id = excluded.chat_bg_file_id, updated_at = excluded.updated_at`
+  ).bind(username, chatBgFileId, theme, Date.now()).run();
+
+  return json({ ok: true, chat_bg_file_id: chatBgFileId });
+}
+
+// ---------- حذفِ پس‌زمینه‌ی چت (برگشت به حالتِ پیش‌فرض) ----------
+async function handleRemoveChatBg(request, env) {
+  const username = await getUserFromToken(request, env);
+  if (!username) return json({ error: "ابتدا وارد شو" }, 401);
+
+  await env.D1.prepare("UPDATE profiles SET chat_bg_file_id = NULL, updated_at = ? WHERE username = ?")
+    .bind(Date.now(), username).run();
+
+  return json({ ok: true });
 }
 
 // #endregion
@@ -6383,6 +6441,12 @@ async function routeRequest(url, request, env, ctx) {
       }
       if (url.pathname === "/api/profile" && request.method === "POST") {
         return await handleUpdateProfile(request, env);
+      }
+      if (url.pathname === "/api/profile/chat-bg" && request.method === "POST") {
+        return await handleUpdateChatBg(request, env);
+      }
+      if (url.pathname === "/api/profile/chat-bg" && request.method === "DELETE") {
+        return await handleRemoveChatBg(request, env);
       }
       if (url.pathname === "/api/username/check" && request.method === "GET") {
         return await handleCheckUsername(request, env);
