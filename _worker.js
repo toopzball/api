@@ -69,6 +69,10 @@ function bind(stmt, args) {
 // این ستون رو هم (یک‌بار، توی کنسول D1) اضافه کن؛ فقط برای پست‌های نوع photo/video معنی داره:
 //   ALTER TABLE posts ADD COLUMN radio_visual INTEGER NOT NULL DEFAULT 0;
 
+// ================= پین‌کردنِ پست توسط ادمین (همیشه بالای فید، برای همه) =================
+// این ستون رو هم (یک‌بار، توی کنسول D1) اضافه کن:
+//   ALTER TABLE posts ADD COLUMN pinned INTEGER NOT NULL DEFAULT 0;
+
 function base64UrlToUint8Array(base64Url) {
   const padding = "=".repeat((4 - (base64Url.length % 4)) % 4);
   const base64 = (base64Url + padding).replace(/-/g, "+").replace(/_/g, "/");
@@ -2995,6 +2999,36 @@ async function handleDeletePost(request, env) {
 }
 
 // #endregion
+// #region پین‌کردنِ پست توسط ادمین
+// ---------- پین/آن‌پینِ پست (فقط مالکِ سایت، دقیقاً همون سطحِ دسترسیِ حذفِ پستِ دیگران) ----------
+async function handlePinPost(request, env) {
+  const username = await getUserFromToken(request, env);
+  if (!username) return json({ error: "ابتدا وارد شو" }, 401);
+
+  if (!canModerateContent(await getAdminRank(env, username))) {
+    return json({ error: "فقط مالکِ سایت می‌تونه پست رو پین کنه" }, 403);
+  }
+
+  let body;
+  try {
+    body = await request.json();
+  } catch (e) {
+    return json({ error: "درخواست نامعتبره" }, 400);
+  }
+
+  const id = (body.id || "").toString();
+  const pinned = !!body.pinned;
+  if (!id) return json({ error: "شناسه پست لازمه" }, 400);
+
+  const post = await env.D1.prepare("SELECT id FROM posts WHERE id = ?").bind(id).first();
+  if (!post) return json({ error: "پست پیدا نشد" }, 404);
+
+  await env.D1.prepare("UPDATE posts SET pinned = ? WHERE id = ?").bind(pinned ? 1 : 0, id).run();
+
+  return json({ ok: true, id, pinned });
+}
+
+// #endregion
 // #region گرفتن فید (با صفحه‌بندی و فیلتر رسانه/متن)
 // ---------- گرفتن فید (با صفحه‌بندی و فیلتر رسانه/متن) ----------
 // #endregion
@@ -3059,7 +3093,9 @@ async function fetchFeedPage(env, viewerUsername, opts) {
     unseenOnly = false,
   } = opts || {};
 
-  const orderBySql = sort === "popular" ? "upvotes DESC, date DESC" : sort === "random" ? "RANDOM()" : "date DESC";
+  // پست‌های پین‌شده فقط تویِ فیدِ عادی (سورتِ date) بالای همه میان؛ تویِ «محبوب‌ترین‌ها» و صفِ رندومِ
+  // رادیو معنی نداره که پین دخالت کنه، پس اونجا رفتارِ قبلی دست‌نخورده می‌مونه.
+  const orderBySql = sort === "popular" ? "upvotes DESC, date DESC" : sort === "random" ? "RANDOM()" : "pinned DESC, date DESC";
 
   const where = [];
   const params = [];
@@ -3164,6 +3200,7 @@ async function fetchFeedPage(env, viewerUsername, opts) {
     userVote: voteMap[p.id] || null,
     liked: !!likeMap[p.id],
     comment_count: commentCountMap[p.id] || 0,
+    pinned: !!p.pinned,
   }));
 
   return {
@@ -6150,6 +6187,9 @@ async function routeRequest(url, request, env, ctx) {
       }
       if (url.pathname === "/api/post" && request.method === "DELETE") {
         return await handleDeletePost(request, env);
+      }
+      if (url.pathname === "/api/post/pin" && request.method === "POST") {
+        return await handlePinPost(request, env);
       }
       if (url.pathname === "/api/comment" && request.method === "POST") {
         return await handleAddComment(request, env, ctx);
