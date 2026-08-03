@@ -3049,7 +3049,7 @@ async function handleEditPost(request, env) {
 
   const text = (body.text || "").toString().trim();
   const title = (body.title || "").toString().trim().slice(0, 15);
-  const hasMedia = post.type === "photo" || post.type === "video" || post.type === "audio" || post.type === "document";
+  const hasMedia = post.type === "photo" || post.type === "video" || post.type === "audio" || post.type === "document" || !!post.drawing_file_id;
   if (!text && !hasMedia) return json({ error: "پست نمی‌تونه خالی باشه" }, 400);
   if (text.length > 2000) return json({ error: "متن خیلی طولانیه" }, 400);
   if (title.length > 15) return json({ error: "عنوان نباید بیشتر از ۱۵ کاراکتر باشه" }, 400);
@@ -4940,19 +4940,47 @@ async function handleChatDeleteGroup(request, env) {
 }
 
 // #endregion
+// #region چت: پیام‌های ذخیره‌شده (یه گفتگوی تک‌نفره‌ی مخصوصِ خودِ کاربر، برای نگه‌داشتنِ یادداشت/پیام)
+// ---------- چت: مطمئن‌شدن از وجودِ گفتگوی «پیام‌های ذخیره‌شده»ی یک کاربر (اگه نبود، می‌سازدش) ----------
+const SAVED_MESSAGES_TITLE = "پیام‌های ذخیره‌شده";
+function savedMessagesConversationId(username) {
+  return `saved_${username}`;
+}
+async function ensureSavedMessagesConversation(env, username) {
+  const conversationId = savedMessagesConversationId(username);
+  const existing = await env.D1.prepare("SELECT id FROM chat_conversations WHERE id = ?").bind(conversationId).first();
+  if (existing) return conversationId;
+  const now = Date.now();
+  await bind(
+    env.D1.prepare(
+      "INSERT INTO chat_conversations (id, type, title, created_by, created_at, last_message_at) VALUES (?, 'saved', ?, ?, ?, NULL)"
+    ),
+    [conversationId, SAVED_MESSAGES_TITLE, username, now]
+  ).run();
+  await bind(
+    env.D1.prepare(
+      "INSERT INTO chat_conversation_members (conversation_id, username, role, joined_at, last_read_at) VALUES (?, ?, 'owner', ?, 0)"
+    ),
+    [conversationId, username, now]
+  ).run();
+  return conversationId;
+}
+
+// #endregion
 // #region چت: لیست گفتگوهای کاربر (با آخرین پیام و تعداد نخوانده)
 // ---------- چت: لیست گفتگوهای کاربر (با آخرین پیام و تعداد نخوانده) ----------
 async function handleChatList(request, env) {
   const username = await getUserFromToken(request, env);
   if (!username) return json({ error: "ابتدا وارد شو" }, 401);
   touchUserPresence(env, username).catch(() => {});
+  await ensureSavedMessagesConversation(env, username);
 
   const rows = await env.D1.prepare(
     `SELECT c.id, c.type, c.title, c.last_message_at, c.avatar_file_id, m.last_read_at, m.muted
      FROM chat_conversations c
      JOIN chat_conversation_members m ON m.conversation_id = c.id
      WHERE m.username = ?
-     ORDER BY COALESCE(c.last_message_at, c.created_at) DESC
+     ORDER BY (c.type = 'saved') DESC, COALESCE(c.last_message_at, c.created_at) DESC
      LIMIT 100`
   ).bind(username).all();
 
@@ -4981,6 +5009,9 @@ async function handleChatList(request, env) {
         lastActiveAt = await getUserPresence(env, otherUsername);
         online = !!lastActiveAt && Date.now() - lastActiveAt < ONLINE_WINDOW_MS;
       }
+    } else if (row.type === "saved") {
+      // گفتگوی «پیام‌های ذخیره‌شده»: تک‌نفره‌ست، نه بلاک معنی داره نه تعداد عضو
+      displayTitle = SAVED_MESSAGES_TITLE;
     } else {
       const countRow = await env.D1.prepare(
         "SELECT COUNT(*) AS c FROM chat_conversation_members WHERE conversation_id = ?"
@@ -5238,7 +5269,7 @@ async function notifyChatMembersOfNewMessage(env, conv, conversationId, senderUs
   }
 
   const preview =
-    msgType === "text" ? text : msgType === "image" ? "یه عکس فرستاد" : msgType === "video" ? "یه فیلم فرستاد" : msgType === "audio" ? "یه پیامِ صوتی فرستاد" : msgType === "file" ? "یه فایل فرستاد" : "یه استیکر فرستاد";
+    msgType === "text" ? text : msgType === "image" ? "یه عکس فرستاد" : msgType === "video" ? "یه فیلم فرستاد" : msgType === "audio" ? "یه پیامِ صوتی فرستاد" : msgType === "file" ? "یه فایل فرستاد" : msgType === "post_shortcut" ? `یه پست فرستاد: ${text || ""}` : "یه استیکر فرستاد";
   for (const row of members.results || []) {
     if (now - (row.last_active_at || 0) < PRESENCE_WINDOW_MS) continue;
     const isMentioned = mentionedUsernames.has(row.username);
@@ -5295,7 +5326,7 @@ async function handleChatSend(request, env) {
     }
   }
 
-  const msgType = ["text", "image", "video", "audio", "file", "sticker"].includes(body.msgType) ? body.msgType : "text";
+  const msgType = ["text", "image", "video", "audio", "file", "sticker", "post_shortcut"].includes(body.msgType) ? body.msgType : "text";
   let text = null;
   let fileId = null;
   let isExternal = 0;
@@ -5305,6 +5336,14 @@ async function handleChatSend(request, env) {
   if (msgType === "text") {
     text = String(body.text || "").trim().slice(0, 2000);
     if (!text) return json({ error: "متن پیام خالیه" }, 400);
+  } else if (msgType === "post_shortcut") {
+    // شورتکاتِ فوروارد یه پست: بجای فایل، شناسه‌ی همون پست تو ستونِ file_id ذخیره می‌شه (این نوع پیام هیچ فایلِ واقعی‌ای نداره)
+    const postId = (body.postId || "").toString().trim();
+    if (!postId) return json({ error: "شناسه‌ی پست لازمه" }, 400);
+    const postExists = await env.D1.prepare("SELECT id FROM posts WHERE id = ?").bind(postId).first();
+    if (!postExists) return json({ error: "پست پیدا نشد" }, 404);
+    fileId = postId;
+    text = String(body.text || "پست").trim().slice(0, 100) || "پست";
   } else if (msgType === "sticker") {
     // درست مثل استیکر تو کامنت: یا sticker_id (استیکرِ شخصیِ آپلودشده روی تلگرام) یا sticker_url (استیکر پیش‌فرض از ریپوی گیت‌هاب)
     if (body.stickerId) {
@@ -5374,7 +5413,7 @@ async function handleChatSend(request, env) {
   // همون‌جا هم لاگ می‌شه؛ صرفاً یه بک‌آپِ خامِ فقط-خواندنیه، D1 همچنان منبعِ اصلیِ چیزیه که خودِ سایت نشون می‌ده.
   // best-effort‌ه: نبودِ این متغیر یا خطای شبکه نباید جلوی ارسال خودِ پیام رو بگیره
   if (env.CHAT_LOG_CHAT_ID) {
-    const logText = msgType === "text" ? text : msgType === "image" ? "[عکس]" : msgType === "video" ? "[فیلم]" : msgType === "audio" ? "[پیامِ صوتی]" : msgType === "file" ? `[فایل: ${fileName || ""}]` : "[استیکر]";
+    const logText = msgType === "text" ? text : msgType === "image" ? "[عکس]" : msgType === "video" ? "[فیلم]" : msgType === "audio" ? "[پیامِ صوتی]" : msgType === "file" ? `[فایل: ${fileName || ""}]` : msgType === "post_shortcut" ? `[پست: ${text || ""}]` : "[استیکر]";
     sendTelegramTextTo(env, env.CHAT_LOG_CHAT_ID, `#گفتگو_${conversationId}\n${username}: ${logText}`).catch(() => {});
   }
 
