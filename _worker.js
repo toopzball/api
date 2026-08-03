@@ -73,6 +73,12 @@ function bind(stmt, args) {
 // این ستون رو هم (یک‌بار، توی کنسول D1) اضافه کن:
 //   ALTER TABLE posts ADD COLUMN pinned INTEGER NOT NULL DEFAULT 0;
 
+// ================= «متن نقاشی»: نقاشیِ همراهِ پست‌های متنی =================
+// فقط برای پست‌های نوع text پر می‌شه؛ خودِ نقاشی مثلِ بقیه‌ی رسانه‌ها به تلگرام فرستاده می‌شه و
+// فقط file_id ش اینجا ذخیره می‌شه (همون الگوی audio_thumb/video_thumb). این ستون رو هم (یک‌بار،
+// توی کنسول D1) اضافه کن:
+//   ALTER TABLE posts ADD COLUMN drawing_file_id TEXT;
+
 // ================= ویرایشِ پست توسط صاحبش (منوی سه‌نقطه‌ی پست کارت) =================
 // این ستون رو هم (یک‌بار، توی کنسول D1) اضافه کن:
 //   ALTER TABLE posts ADD COLUMN edited INTEGER NOT NULL DEFAULT 0;
@@ -1210,6 +1216,11 @@ async function handlePost(request, env) {
   const audioCoverFile = form.get("audio_cover");
   const hasAudioCover = audioCoverFile && typeof audioCoverFile !== "string" && audioCoverFile.size > 0
     && audioCoverFile.size <= 5 * 1024 * 1024;
+  // «نقاشیِ متن»: فقط برای پست‌های متنی معنی داره (بدون فایل/آپلودِ ازقبل‌آماده)؛ خروجیِ PNG کوچیکیه
+  // که کلاینت از کانواسِ نقاشی می‌سازه
+  const drawingFile = form.get("drawing");
+  const hasDrawing = drawingFile && typeof drawingFile !== "string" && drawingFile.size > 0
+    && drawingFile.size <= 5 * 1024 * 1024;
   // تیکِ «نمایش در رادیو دهات»؛ فقط برای عکس/ویدیو معنی داره — یعنی این رسانه به‌عنوانِ پس‌زمینه‌ی
   // تمام‌صفحه‌ی رادیونما (بدونِ صدا، هر ۴۵ ثانیه عوض می‌شه) هم استفاده بشه
   const clientRadioVisual = ["1", "true", "on"].includes((form.get("radio_visual") || "").toString().trim().toLowerCase());
@@ -1244,6 +1255,7 @@ async function handlePost(request, env) {
   let type = "text";
   let result;
   let audioCoverFileId = null;
+  let drawingFileId = null;
 
   try {
     if (hasPreUploaded) {
@@ -1311,6 +1323,16 @@ async function handlePost(request, env) {
       type = "text";
       result = await sendTelegramText(env, caption);
     }
+    // نقاشیِ متن: فقط وقتی پست واقعاً «متن»ه (نه عکس/ویدیو/آهنگ) و بدونِ preUploaded — جدا از خودِ
+    // پیامِ متنی، به‌عنوانِ یه عکس به تلگرام فرستاده می‌شه و فقط file_id ش نگه داشته می‌شه
+    if (type === "text" && hasDrawing && (await verifyFileMatchesCategory(drawingFile, "image"))) {
+      try {
+        const drawingResult = await sendTelegramFile(env, "sendPhoto", "photo", drawingFile, `نقاشی — ${username}`);
+        drawingFileId = extractFileId("photo", drawingResult);
+      } catch (drawingErr) {
+        console.error("خطای آپلود نقاشیِ متن:", drawingErr.message);
+      }
+    }
   } catch (err) {
     console.error("خطای ارسال پست به تلگرام:", err);
     return json({ error: "ارسال پست ناموفق بود، دوباره امتحان کن" }, 502);
@@ -1337,6 +1359,7 @@ async function handlePost(request, env) {
     video_thumb: null,
     tags: tagsJson,
     radio_visual: clientRadioVisual && (type === "photo" || type === "video") ? 1 : 0,
+    drawing_file_id: drawingFileId,
   };
   // نکته: قبلاً این شرط `result.audio &&` هم داشت که فقط وقتی صدق می‌کرد که خودِ handlePost مستقیم
   // فایل رو به تلگرام فرستاده باشه؛ برای مسیرِ آپلودِ چانکی (hasPreUploaded) چون فایل قبلاً (توی
@@ -1360,10 +1383,10 @@ async function handlePost(request, env) {
   try {
     await bind(
       env.D1.prepare(
-        `INSERT INTO posts (id, username, text, title, type, file_id, message_id, bot_slot, date, upvotes, downvotes, likes, audio_title, audio_performer, audio_thumb, audio_feeling, video_thumb, tags, duration_seconds, radio_visual)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, 0, ?, ?, ?, ?, ?, ?, ?, ?)`
+        `INSERT INTO posts (id, username, text, title, type, file_id, message_id, bot_slot, date, upvotes, downvotes, likes, audio_title, audio_performer, audio_thumb, audio_feeling, video_thumb, tags, duration_seconds, radio_visual, drawing_file_id)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
       ),
-      [post.id, post.username, post.text, post.title, post.type, post.file_id, post.message_id, post.bot_slot, post.date, post.audio_title, post.audio_performer, post.audio_thumb, post.audio_feeling, post.video_thumb, post.tags, post.duration_seconds || null, post.radio_visual]
+      [post.id, post.username, post.text, post.title, post.type, post.file_id, post.message_id, post.bot_slot, post.date, post.audio_title, post.audio_performer, post.audio_thumb, post.audio_feeling, post.video_thumb, post.tags, post.duration_seconds || null, post.radio_visual, post.drawing_file_id]
     ).run();
   } catch (err) {
     // اگه اینجا خطا بخوره (مثلاً یه مقدارِ نامعتبر برایِ D1)، قبلاً بدونِ گرفتنش می‌رفت به handlerِ
