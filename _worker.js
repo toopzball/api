@@ -83,6 +83,26 @@ function bind(stmt, args) {
 // این ستون رو هم (یک‌بار، توی کنسول D1) اضافه کن:
 //   ALTER TABLE posts ADD COLUMN edited INTEGER NOT NULL DEFAULT 0;
 
+// ================= محضر: خواستگاری بین دو کاربر =================
+// یه فعالیتِ جدید تویِ «ده‌دودز» (کنارِ رادیو) به اسمِ «محضر» که دو تا زیربخش داره: «خواستگاری»
+// (فرستادنِ درخواست به یه کاربرِ دیگه، با یه عنوانِ انتخابی برای خودِ فرستنده — شوهر یا همسر —
+// و یه متنِ حداکثر ۵۰ کاراکتری) و «درخواست‌ها» (دیدنِ خواستگاری‌هایی که برای خودِ کاربر اومده و
+// قبول/ردشون). یه کاربر تا وقتی خواستگاریِ درحال‌انتظارش رد یا لغو نشه، نمی‌تونه به کسِ دیگه‌ای
+// خواستگاری بده؛ وقتی قبول بشه، تو پروفایلِ هرکدوم عنوانِ انتخابیِ طرفِ مقابل (که خودکار برعکسِ
+// عنوانِ خودشه) نشون داده می‌شه. این جدولِ جدید رو (یک‌بار، توی کنسول D1) بساز:
+//   CREATE TABLE IF NOT EXISTS marriage_proposals (
+//     id TEXT PRIMARY KEY,
+//     from_username TEXT NOT NULL,
+//     to_username TEXT NOT NULL,
+//     from_title TEXT NOT NULL,
+//     message TEXT,
+//     status TEXT NOT NULL DEFAULT 'pending',
+//     created_at INTEGER NOT NULL,
+//     responded_at INTEGER
+//   );
+//   CREATE INDEX IF NOT EXISTS idx_marriage_from ON marriage_proposals (from_username, status);
+//   CREATE INDEX IF NOT EXISTS idx_marriage_to ON marriage_proposals (to_username, status);
+
 function base64UrlToUint8Array(base64Url) {
   const padding = "=".repeat((4 - (base64Url.length % 4)) % 4);
   const base64 = (base64Url + padding).replace(/-/g, "+").replace(/_/g, "/");
@@ -2664,6 +2684,8 @@ async function createNotification(env, toUsername, data) {
     comment: (d) => `${d.from_username} روی پستت کامنت گذاشت`,
     reply: (d) => `${d.from_username} به کامنتت جواب داد`,
     vote: (d) => `${d.from_username} به پستت رای مثبت داد`,
+    marriage_request: (d) => `${d.from_username} تو محضر ازت خواستگاری کرد`,
+    marriage_accept: (d) => `${d.from_username} خواستگاریت رو قبول کرد`,
   };
   const bodyBuilder = pushMessages[data.type];
   if (bodyBuilder) {
@@ -3537,6 +3559,16 @@ async function handleGetProfile(request, env) {
     "SELECT COALESCE(SUM(upvotes), 0) AS totalUpvotes, COALESCE(SUM(likes), 0) AS totalLikes FROM posts WHERE username = ?"
   ).bind(username).first();
 
+  // اگه این کاربر تویِ محضر ازدواج کرده، عنوانِ انتخابیِ خودش (شوهر/همسر) رو هم برای نمایشِ
+  // کنارِ اسمش تو پروفایل برمی‌گردونیم
+  let marriageTitle = null;
+  const marriageRow = await env.D1.prepare(
+    "SELECT * FROM marriage_proposals WHERE status = 'accepted' AND (from_username = ? OR to_username = ?)"
+  ).bind(username, username).first();
+  if (marriageRow) {
+    marriageTitle = marriageRow.from_username === username ? marriageRow.from_title : oppositeMarriageTitle(marriageRow.from_title);
+  }
+
   // اگه پروفایل خودش نیست، چک می‌کنیم قبلاً گزارشش داده یا نه
   let reportedByMe = false;
   if (viewer !== username) {
@@ -3559,6 +3591,7 @@ async function handleGetProfile(request, env) {
       total_likes: (totals && totals.totalLikes) || 0,
       reported_by_me: reportedByMe,
       referred_by: user.referred_by || null,
+      marriage_title: marriageTitle,
     },
   });
 }
@@ -6425,6 +6458,185 @@ async function handleChangePassword(request, env) {
 }
 
 // #endregion
+// #region محضر: خواستگاری بین دو کاربر
+// ---------- محضر: خواستگاری بین دو کاربر ----------
+const MARRIAGE_TITLES = ["شوهر", "همسر"];
+function oppositeMarriageTitle(t) {
+  return t === "شوهر" ? "همسر" : "شوهر";
+}
+
+// خواستگاریِ درحال‌انتظارِ فرستاده‌شده توسطِ این کاربر (اگه باشه) و ازدواجِ فعلیش (اگه باشه) رو برمی‌گردونه
+async function getMarriageStateFor(env, username) {
+  const outgoing = await env.D1.prepare(
+    "SELECT * FROM marriage_proposals WHERE from_username = ? AND status = 'pending'"
+  ).bind(username).first();
+  const marriage = await env.D1.prepare(
+    "SELECT * FROM marriage_proposals WHERE status = 'accepted' AND (from_username = ? OR to_username = ?)"
+  ).bind(username, username).first();
+  return { outgoing: outgoing || null, marriage: marriage || null };
+}
+
+async function handleMarriageStatus(request, env) {
+  const username = await getUserFromToken(request, env);
+  if (!username) return json({ error: "ابتدا وارد شو" }, 401);
+
+  const { outgoing, marriage } = await getMarriageStateFor(env, username);
+
+  let spouse = null;
+  if (marriage) {
+    const isFrom = marriage.from_username === username;
+    const spouseUsername = isFrom ? marriage.to_username : marriage.from_username;
+    const myTitle = isFrom ? marriage.from_title : oppositeMarriageTitle(marriage.from_title);
+    const spouseProfile = await env.D1.prepare("SELECT avatar_file_id FROM profiles WHERE username = ?").bind(spouseUsername).first();
+    spouse = {
+      username: spouseUsername,
+      my_title: myTitle,
+      spouse_title: oppositeMarriageTitle(myTitle),
+      since: marriage.responded_at,
+      avatar_file_id: (spouseProfile && spouseProfile.avatar_file_id) || null,
+    };
+  }
+
+  return json({
+    ok: true,
+    outgoing: outgoing
+      ? { id: outgoing.id, to_username: outgoing.to_username, title: outgoing.from_title, message: outgoing.message || "", created_at: outgoing.created_at }
+      : null,
+    spouse,
+  });
+}
+
+async function handleMarriagePropose(request, env) {
+  const username = await getUserFromToken(request, env);
+  if (!username) return json({ error: "ابتدا وارد شو" }, 401);
+  if (!(await checkRateLimit(env, "marriage_propose", username, 10, 3600))) {
+    return json({ error: "زیاد خواستگاری فرستادی، کمی بعد امتحان کن" }, 429);
+  }
+
+  let body;
+  try {
+    body = await request.json();
+  } catch (e) {
+    return json({ error: "درخواست نامعتبره" }, 400);
+  }
+
+  const toUsername = (body.to_username || "").toString().trim();
+  const title = (body.title || "").toString().trim();
+  const message = (body.message || "").toString().trim().slice(0, 50);
+
+  if (!toUsername) return json({ error: "باید یه نفر رو انتخاب کنی" }, 400);
+  if (toUsername === username) return json({ error: "نمی‌تونی از خودت خواستگاری کنی" }, 400);
+  if (!MARRIAGE_TITLES.includes(title)) return json({ error: "عنوان نامعتبره" }, 400);
+
+  const targetUser = await env.D1.prepare("SELECT username FROM users WHERE username = ?").bind(toUsername).first();
+  if (!targetUser) return json({ error: "کاربر پیدا نشد" }, 404);
+
+  const myState = await getMarriageStateFor(env, username);
+  if (myState.marriage) return json({ error: "تو الان همسر داری" }, 400);
+  if (myState.outgoing) return json({ error: "یه خواستگاریِ درحالِ‌انتظار داری؛ اول باید لغوش کنی" }, 400);
+
+  const targetState = await getMarriageStateFor(env, toUsername);
+  if (targetState.marriage) return json({ error: "این کاربر الان همسر داره" }, 400);
+
+  const id = `${Date.now()}_${randomHex(4)}`;
+  await bind(
+    env.D1.prepare(
+      "INSERT INTO marriage_proposals (id, from_username, to_username, from_title, message, status, created_at) VALUES (?, ?, ?, ?, ?, 'pending', ?)"
+    ),
+    [id, username, toUsername, title, message || null, Date.now()]
+  ).run();
+
+  await createNotification(env, toUsername, { type: "marriage_request", from_username: username, text: message || null });
+
+  return json({ ok: true, id });
+}
+
+async function handleMarriageCancel(request, env) {
+  const username = await getUserFromToken(request, env);
+  if (!username) return json({ error: "ابتدا وارد شو" }, 401);
+
+  const outgoing = await env.D1.prepare(
+    "SELECT * FROM marriage_proposals WHERE from_username = ? AND status = 'pending'"
+  ).bind(username).first();
+  if (!outgoing) return json({ error: "خواستگاریِ درحالِ‌انتظاری نداری" }, 404);
+
+  await env.D1.prepare("UPDATE marriage_proposals SET status = 'cancelled', responded_at = ? WHERE id = ?").bind(Date.now(), outgoing.id).run();
+  return json({ ok: true });
+}
+
+async function handleMarriageRequests(request, env) {
+  const username = await getUserFromToken(request, env);
+  if (!username) return json({ error: "ابتدا وارد شو" }, 401);
+
+  const rows = await env.D1.prepare(
+    "SELECT * FROM marriage_proposals WHERE to_username = ? AND status = 'pending' ORDER BY created_at DESC"
+  ).bind(username).all();
+
+  const list = rows.results || [];
+  const out = [];
+  for (const r of list) {
+    const profile = await env.D1.prepare("SELECT avatar_file_id, bio FROM profiles WHERE username = ?").bind(r.from_username).first();
+    out.push({
+      id: r.id,
+      from_username: r.from_username,
+      from_title: r.from_title,
+      message: r.message || "",
+      created_at: r.created_at,
+      avatar_file_id: (profile && profile.avatar_file_id) || null,
+      bio: (profile && profile.bio) || "",
+    });
+  }
+
+  return json({ ok: true, requests: out });
+}
+
+async function handleMarriageRespond(request, env) {
+  const username = await getUserFromToken(request, env);
+  if (!username) return json({ error: "ابتدا وارد شو" }, 401);
+
+  let body;
+  try {
+    body = await request.json();
+  } catch (e) {
+    return json({ error: "درخواست نامعتبره" }, 400);
+  }
+
+  const id = (body.id || "").toString();
+  const action = (body.action || "").toString();
+  if (!id || (action !== "accept" && action !== "reject")) return json({ error: "درخواست نامعتبره" }, 400);
+
+  const row = await env.D1.prepare("SELECT * FROM marriage_proposals WHERE id = ?").bind(id).first();
+  if (!row) return json({ error: "درخواست پیدا نشد" }, 404);
+  if (row.to_username !== username) return json({ error: "دسترسی نداری" }, 403);
+  if (row.status !== "pending") return json({ error: "این درخواست قبلاً پاسخ داده شده" }, 400);
+
+  if (action === "reject") {
+    await env.D1.prepare("UPDATE marriage_proposals SET status = 'rejected', responded_at = ? WHERE id = ?").bind(Date.now(), id).run();
+    return json({ ok: true });
+  }
+
+  const [myState, senderState] = await Promise.all([getMarriageStateFor(env, username), getMarriageStateFor(env, row.from_username)]);
+  if (myState.marriage) return json({ error: "تو الان همسر داری" }, 400);
+  if (senderState.marriage) return json({ error: "این کاربر الان همسر داره" }, 400);
+
+  const now = Date.now();
+  await env.D1.prepare("UPDATE marriage_proposals SET status = 'accepted', responded_at = ? WHERE id = ?").bind(now, id).run();
+
+  // بقیه‌ی خواستگاری‌های درحال‌انتظارِ مربوط به هرکدوم از این دو نفر (چه فرستاده چه گرفته)
+  // دیگه معنی نداره، پس خودکار رد می‌شن
+  await bind(
+    env.D1.prepare(
+      "UPDATE marriage_proposals SET status = 'rejected', responded_at = ? WHERE status = 'pending' AND id != ? AND (from_username = ? OR to_username = ? OR from_username = ? OR to_username = ?)"
+    ),
+    [now, id, username, username, row.from_username, row.from_username]
+  ).run();
+
+  await createNotification(env, row.from_username, { type: "marriage_accept", from_username: username, text: null });
+
+  return json({ ok: true });
+}
+
+// #endregion
 // #region تشخیص مسیر و صدا زدن هندلر مربوطه (بدون هدر CORS؛ CORS در fetch اصلی اضافه می‌شه)
 // ---------- تشخیص مسیر و صدا زدن هندلر مربوطه (بدون هدر CORS؛ CORS در fetch اصلی اضافه می‌شه) ----------
 async function routeRequest(url, request, env, ctx) {
@@ -6500,6 +6712,21 @@ async function routeRequest(url, request, env, ctx) {
       }
       if (url.pathname === "/api/profile" && request.method === "GET") {
         return await handleGetProfile(request, env);
+      }
+      if (url.pathname === "/api/marriage/status" && request.method === "GET") {
+        return await handleMarriageStatus(request, env);
+      }
+      if (url.pathname === "/api/marriage/propose" && request.method === "POST") {
+        return await handleMarriagePropose(request, env);
+      }
+      if (url.pathname === "/api/marriage/cancel" && request.method === "POST") {
+        return await handleMarriageCancel(request, env);
+      }
+      if (url.pathname === "/api/marriage/requests" && request.method === "GET") {
+        return await handleMarriageRequests(request, env);
+      }
+      if (url.pathname === "/api/marriage/respond" && request.method === "POST") {
+        return await handleMarriageRespond(request, env);
       }
       if (url.pathname === "/api/profile" && request.method === "POST") {
         return await handleUpdateProfile(request, env);
