@@ -3559,14 +3559,33 @@ async function handleGetProfile(request, env) {
     "SELECT COALESCE(SUM(upvotes), 0) AS totalUpvotes, COALESCE(SUM(likes), 0) AS totalLikes FROM posts WHERE username = ?"
   ).bind(username).first();
 
-  // اگه این کاربر تویِ محضر ازدواج کرده، عنوانِ انتخابیِ خودش (شوهر/همسر) رو هم برای نمایشِ
-  // کنارِ اسمش تو پروفایل برمی‌گردونیم
+  // اگه این کاربر تویِ محضر ازدواج کرده، عنوانِ انتخابیِ خودش (شوهر/همسر) و اطلاعاتِ همسرش
+  // (برای نمایشِ آواتار/اسمِ قابل‌کلیک تو پروفایل) رو هم برمی‌گردونیم
   let marriageTitle = null;
+  let spouse = null;
   const marriageRow = await env.D1.prepare(
     "SELECT * FROM marriage_proposals WHERE status = 'accepted' AND (from_username = ? OR to_username = ?)"
   ).bind(username, username).first();
   if (marriageRow) {
-    marriageTitle = marriageRow.from_username === username ? marriageRow.from_title : oppositeMarriageTitle(marriageRow.from_title);
+    const isFrom = marriageRow.from_username === username;
+    marriageTitle = isFrom ? marriageRow.from_title : oppositeMarriageTitle(marriageRow.from_title);
+    const spouseUsername = isFrom ? marriageRow.to_username : marriageRow.from_username;
+    const spouseTitle = isFrom ? oppositeMarriageTitle(marriageRow.from_title) : marriageRow.from_title;
+    const spouseProfile = await env.D1.prepare("SELECT avatar_file_id FROM profiles WHERE username = ?").bind(spouseUsername).first();
+    spouse = {
+      username: spouseUsername,
+      title: spouseTitle,
+      avatar_file_id: (spouseProfile && spouseProfile.avatar_file_id) || null,
+    };
+  }
+
+  // امتیازِ dehpoints (مشترک با Workerِ بازی‌ها، از همون جدولِ D1)
+  let dehpoints = 0;
+  try {
+    const pointsRow = await env.D1.prepare("SELECT points FROM dehpoints WHERE username = ?").bind(username).first();
+    dehpoints = (pointsRow && pointsRow.points) || 0;
+  } catch (e) {
+    // اگه جدولِ dehpoints هنوز ساخته نشده باشه، صفر برمی‌گردونیم
   }
 
   // اگه پروفایل خودش نیست، چک می‌کنیم قبلاً گزارشش داده یا نه
@@ -3592,6 +3611,8 @@ async function handleGetProfile(request, env) {
       reported_by_me: reportedByMe,
       referred_by: user.referred_by || null,
       marriage_title: marriageTitle,
+      spouse,
+      dehpoints,
     },
   });
 }
