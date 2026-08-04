@@ -1,0 +1,11 @@
+[[durable_objects.bindings]]
+name = "DOOZ_ROOM"
+class_name = "DoozRoom"
+
+[[durable_objects.bindings]]
+name = "DOOZ_LOBBY"
+class_name = "DoozLobby"
+
+[[migrations]]
+tag = "v-dooz-1"
+new_classes = ["DoozRoom", "DoozLobby"]
