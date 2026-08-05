@@ -1245,6 +1245,13 @@ async function handlePost(request, env) {
   // تمام‌صفحه‌ی رادیونما (بدونِ صدا، هر ۴۵ ثانیه عوض می‌شه) هم استفاده بشه
   const clientRadioVisual = ["1", "true", "on"].includes((form.get("radio_visual") || "").toString().trim().toLowerCase());
 
+  // «سرو غذا»: فقط برای سرآشپزها معنی داره — اگه تیک بخوره، این پست اصلاً وارد فیدِ عادی نمی‌شه،
+  // فقط به‌عنوانِ یه آیتمِ منوی رستوران ذخیره می‌شه (پایین‌تر همین تابع مدیریتش می‌کنه)
+  const serveFood = ["1", "true", "on"].includes((form.get("serve_food") || "").toString().trim().toLowerCase());
+  const foodPriceRaw = Number(form.get("food_price"));
+  const foodPrice = Number.isFinite(foodPriceRaw) && foodPriceRaw > 0 ? Math.round(foodPriceRaw) : null;
+  const foodDescription = (form.get("food_description") || "").toString().trim().slice(0, 300);
+
   // تگ‌ها: دقیقاً همون قانونِ تفکیکِ سمتِ کلاینت (با فاصله/کاما جدا می‌شن)، حداکثر ۶ تا و هر کدوم حداکثر ۳۰ کاراکتر
   const tagsRaw = (form.get("tags") || "").toString().trim();
   let tags = [];
@@ -1269,6 +1276,12 @@ async function handlePost(request, env) {
   }
   if (hasFile && !(await verifyFileMatchesCategory(file, file.type.split("/")[0]))) {
     return json({ error: "محتوای فایل با نوع اعلام‌شده‌اش مطابقت نداره" }, 400);
+  }
+
+  if (serveFood) {
+    if (!(await isChefUser(env, username))) return json({ error: "فقط سرآشپزها می‌تونن غذا سرو کنن" }, 403);
+    if (!hasFile || !file.type.startsWith("image/")) return json({ error: "غذا باید با یه عکس سرو بشه" }, 400);
+    if (!foodPrice) return json({ error: "قیمتِ غذا (به دهپوینت) نامعتبره" }, 400);
   }
 
   const caption = text ? `${username}\n\n${text}` : username;
@@ -1356,6 +1369,18 @@ async function handlePost(request, env) {
   } catch (err) {
     console.error("خطای ارسال پست به تلگرام:", err);
     return json({ error: "ارسال پست ناموفق بود، دوباره امتحان کن" }, 502);
+  }
+
+  if (serveFood) {
+    const foodFileId = hasPreUploaded ? preUploadedFileId : extractFileId(type, result);
+    const foodId = `${Date.now()}_${randomHex(4)}`;
+    await env.D1.prepare(
+      `INSERT INTO restaurant_items (id, chef_username, file_id, title, description, price_points, created_at, active)
+       VALUES (?, ?, ?, ?, ?, ?, ?, 1)`
+    )
+      .bind(foodId, username, foodFileId, title || "بدون‌نام", foodDescription || null, foodPrice, Date.now())
+      .run();
+    return json({ ok: true, restaurantItemId: foodId });
   }
 
   const id = `${Date.now()}_${randomHex(4)}`;
@@ -1748,7 +1773,8 @@ async function handleRadioDurationsFix(request, env) {
   const body = await request.json().catch(() => ({}));
   const postId = body.postId;
   const duration = Number(body.duration);
-  if (!postId || !Number.isFinite(duration) || duration <= 0) {
+  // آهنگ‌ها عملاً هیچ‌وقت کوتاه‌تر از ۱۰ ثانیه نیستن؛ این سد جلوی نوشتنِ دوباره‌ی یه مقدارِ ناقص/خراب رو می‌گیره
+  if (!postId || !Number.isFinite(duration) || duration < 10) {
     return json({ error: "ورودی نامعتبره" }, 400);
   }
   await env.D1.prepare("UPDATE posts SET duration_seconds = ? WHERE id = ? AND type = 'audio'")
@@ -3535,6 +3561,118 @@ async function handleUserSearch(request, env) {
   return json({ users: usernames.map((u) => ({ username: u, avatar_file_id: avatarMap[u] || null })) });
 }
 
+// #endregion
+// #region رستوران/آشپزخونه/یخچال
+// یادداشتِ مایگریشن (یه‌بار توی D1 Console اجرا شه):
+//   CREATE TABLE chefs (username TEXT PRIMARY KEY, appointed_at INTEGER);
+//   CREATE TABLE restaurant_items (
+//     id TEXT PRIMARY KEY, chef_username TEXT NOT NULL, file_id TEXT NOT NULL,
+//     title TEXT, description TEXT, price_points INTEGER NOT NULL, created_at INTEGER NOT NULL,
+//     active INTEGER NOT NULL DEFAULT 1
+//   );
+//   CREATE TABLE fridge_items (
+//     id TEXT PRIMARY KEY, username TEXT NOT NULL, restaurant_item_id TEXT NOT NULL,
+//     title TEXT, file_id TEXT, acquired_at INTEGER NOT NULL
+//   );
+
+async function isChefUser(env, username) {
+  if (isSuperAdmin(username)) return true; // مالکِ سایت خودش هم می‌تونه غذا سرو کنه
+  const row = await env.D1.prepare("SELECT username FROM chefs WHERE username = ?").bind(username).first();
+  return !!row;
+}
+
+async function handleChefStatus(request, env) {
+  const username = await getUserFromToken(request, env);
+  if (!username) return json({ error: "لطفاً وارد شو" }, 401);
+  return json({ ok: true, isChef: await isChefUser(env, username) });
+}
+
+async function handleAdminChefsList(request, env) {
+  const username = await getUserFromToken(request, env);
+  if ((await getAdminRank(env, username)) !== 1) return json({ error: "دسترسی نداری" }, 403);
+  const rows = await env.D1.prepare("SELECT username, appointed_at FROM chefs ORDER BY appointed_at DESC").all();
+  return json({ ok: true, chefs: rows.results || [] });
+}
+
+async function handleAdminChefAdd(request, env) {
+  const username = await getUserFromToken(request, env);
+  if ((await getAdminRank(env, username)) !== 1) return json({ error: "دسترسی نداری" }, 403);
+  const body = await request.json().catch(() => ({}));
+  const target = (body.username || "").toString().trim();
+  if (!target) return json({ error: "یوزرنیم نامعتبره" }, 400);
+  await env.D1.prepare("INSERT INTO chefs (username, appointed_at) VALUES (?, ?) ON CONFLICT(username) DO NOTHING")
+    .bind(target, Date.now())
+    .run();
+  return json({ ok: true });
+}
+
+async function handleAdminChefRemove(request, env) {
+  const username = await getUserFromToken(request, env);
+  if ((await getAdminRank(env, username)) !== 1) return json({ error: "دسترسی نداری" }, 403);
+  const body = await request.json().catch(() => ({}));
+  const target = (body.username || "").toString().trim();
+  await env.D1.prepare("DELETE FROM chefs WHERE username = ?").bind(target).run();
+  return json({ ok: true });
+}
+
+async function handleRestaurantMenu(request, env) {
+  const username = await getUserFromToken(request, env);
+  if (!username) return json({ error: "لطفاً وارد شو" }, 401);
+  const rows = await env.D1.prepare(
+    "SELECT id, chef_username, file_id, title, description, price_points, created_at FROM restaurant_items WHERE active = 1 ORDER BY created_at DESC"
+  ).all();
+  return json({ ok: true, items: rows.results || [] });
+}
+
+async function handleRestaurantBuy(request, env) {
+  const username = await getUserFromToken(request, env);
+  if (!username) return json({ error: "لطفاً وارد شو" }, 401);
+  const body = await request.json().catch(() => ({}));
+  const itemId = (body.itemId || "").toString().trim();
+  if (!itemId) return json({ error: "غذا نامعتبره" }, 400);
+
+  const item = await env.D1.prepare("SELECT * FROM restaurant_items WHERE id = ? AND active = 1").bind(itemId).first();
+  if (!item) return json({ error: "این غذا دیگه موجود نیست" }, 404);
+  if (item.chef_username === username) return json({ error: "نمی‌تونی غذای خودت رو بخری" }, 400);
+
+  const balanceRow = await env.D1.prepare("SELECT points FROM dehpoints WHERE username = ?").bind(username).first();
+  const balance = (balanceRow && balanceRow.points) || 0;
+  if (balance < item.price_points) return json({ error: "دهپوینتِ کافی نداری" }, 400);
+
+  // یک‌سومِ قیمت (رند به بالا) به‌عنوانِ اجاره برای مالکِ سایت، بقیه برای سرآشپز
+  const chefShare = Math.floor((item.price_points * 2) / 3);
+  const adminShare = item.price_points - chefShare;
+  const now = Date.now();
+  const fridgeId = `${now}_${randomHex(4)}`;
+
+  await env.D1.batch([
+    env.D1.prepare("UPDATE dehpoints SET points = points - ?, updated_at = ? WHERE username = ?").bind(item.price_points, now, username),
+    env.D1.prepare(
+      `INSERT INTO dehpoints (username, points, updated_at) VALUES (?, ?, ?)
+       ON CONFLICT(username) DO UPDATE SET points = points + excluded.points, updated_at = excluded.updated_at`
+    ).bind(item.chef_username, chefShare, now),
+    env.D1.prepare(
+      `INSERT INTO dehpoints (username, points, updated_at) VALUES (?, ?, ?)
+       ON CONFLICT(username) DO UPDATE SET points = points + excluded.points, updated_at = excluded.updated_at`
+    ).bind(SUPER_ADMIN_USERNAME, adminShare, now),
+    env.D1.prepare(
+      "INSERT INTO fridge_items (id, username, restaurant_item_id, title, file_id, acquired_at) VALUES (?, ?, ?, ?, ?, ?)"
+    ).bind(fridgeId, username, item.id, item.title, item.file_id, now),
+  ]);
+
+  return json({ ok: true });
+}
+
+async function handleRestaurantFridge(request, env) {
+  const username = await getUserFromToken(request, env);
+  if (!username) return json({ error: "لطفاً وارد شو" }, 401);
+  const rows = await env.D1.prepare(
+    "SELECT id, title, file_id, acquired_at FROM fridge_items WHERE username = ? ORDER BY acquired_at DESC"
+  )
+    .bind(username)
+    .all();
+  return json({ ok: true, items: rows.results || [] });
+}
 // #endregion
 // #region پروفایل عمومیِ یک کاربر
 // یادداشت مایگریشن (یه‌بار توی D1 Console اجرا شه):
@@ -6829,6 +6967,27 @@ async function routeRequest(url, request, env, ctx) {
       }
       if (url.pathname === "/api/admin/reports" && request.method === "DELETE") {
         return await handleDismissReport(request, env);
+      }
+      if (url.pathname === "/api/admin/chefs" && request.method === "GET") {
+        return await handleAdminChefsList(request, env);
+      }
+      if (url.pathname === "/api/admin/chefs/add" && request.method === "POST") {
+        return await handleAdminChefAdd(request, env);
+      }
+      if (url.pathname === "/api/admin/chefs/remove" && request.method === "POST") {
+        return await handleAdminChefRemove(request, env);
+      }
+      if (url.pathname === "/api/restaurant/chef-status" && request.method === "GET") {
+        return await handleChefStatus(request, env);
+      }
+      if (url.pathname === "/api/restaurant/menu" && request.method === "GET") {
+        return await handleRestaurantMenu(request, env);
+      }
+      if (url.pathname === "/api/restaurant/buy" && request.method === "POST") {
+        return await handleRestaurantBuy(request, env);
+      }
+      if (url.pathname === "/api/restaurant/fridge" && request.method === "GET") {
+        return await handleRestaurantFridge(request, env);
       }
       if (url.pathname === "/api/notifications" && request.method === "GET") {
         return await handleGetNotifications(request, env);
