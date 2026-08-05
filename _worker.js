@@ -1280,7 +1280,11 @@ async function handlePost(request, env) {
 
   if (serveFood) {
     if (!(await isChefUser(env, username))) return json({ error: "فقط سرآشپزها می‌تونن غذا سرو کنن" }, 403);
-    if (!hasFile || !file.type.startsWith("image/")) return json({ error: "غذا باید با یه عکس سرو بشه" }, 400);
+    // عکس یا از مسیرِ قدیمیِ آپلودِ مستقیم میاد (hasFile) یا از مسیرِ چانکی/resumable که فقط
+    // fileId+fileType می‌فرسته (hasPreUploaded)؛ قبلاً فقط حالتِ اول چک می‌شد و همینِ باعث می‌شد
+    // هر عکسی که از مسیرِ چانکی بیاد (که مسیرِ فعلیِ کلاینته) رد بشه
+    const hasFoodImage = (hasFile && file.type.startsWith("image/")) || (hasPreUploaded && preUploadedFileType === "image");
+    if (!hasFoodImage) return json({ error: "غذا باید با یه عکس سرو بشه" }, 400);
     if (!foodPrice) return json({ error: "قیمتِ غذا (به دهپوینت) نامعتبره" }, 400);
   }
 
