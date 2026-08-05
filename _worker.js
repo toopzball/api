@@ -1634,6 +1634,44 @@ function nextSongSegment(tracks, state, segEndMs) {
   };
 }
 
+// اگه وقفه خیلی طولانی باشه (سرور مدت‌ها هیچ درخواستی نداشته)، جلوبردنِ state قدم‌به‌قدم با یه
+// کوئریِ D1 برای هر قدم (توی advanceRadioSegment) هم به سقفِ subrequestِ ورکر می‌خوره هم کاربر رو
+// دقیقه‌ها تو یه حلقه‌ی «آهنگ رد شد، یکی دیگه اومد، اونم رد شد» نگه می‌داره (چون remainingSeconds
+// همیشه رویِ کفِ ۱ ثانیه گیر می‌کنه تا کاملاً catch-up بشه). برای این حالت، یه جهشِ سریعِ کاملاً
+// تو-حافظه داریم: صفِ ویسِ معلق (که مالِ گذشته‌ی خیلی دوره و دیگه معنی نداره پخش بشه) رو یه‌بار
+// منقضی می‌کنیم، بعد فقط با آرایه‌ی از قبل‌خونده‌شده‌ی tracks (بدونِ هیچ کوئریِ اضافه) جلو می‌ریم.
+function fastForwardSongOnly(tracks, state, targetMs) {
+  let segStart = state.segment_start_ms;
+  let segDur = state.segment_duration_seconds;
+  let seed = state.order_seed;
+  let order = seededShuffle(tracks, seed);
+  let cursor = state.song_cursor;
+  let guard = 0;
+  while (segStart + segDur * 1000 <= targetMs && guard < 200000) {
+    segStart += segDur * 1000;
+    cursor += 1;
+    if (cursor >= order.length) {
+      seed = Math.floor(Math.random() * 2 ** 31);
+      order = seededShuffle(tracks, seed);
+      cursor = 0;
+    }
+    const next = order[cursor] || order[0];
+    segDur = trackDurationSeconds(next);
+    guard++;
+  }
+  const finalTrack = order[cursor] || order[0];
+  return {
+    segment_type: "song",
+    segment_start_ms: segStart,
+    segment_duration_seconds: segDur,
+    order_seed: seed,
+    order_length: order.length,
+    song_cursor: cursor,
+    current_song_post_id: finalTrack.id,
+    current_voice_id: null,
+  };
+}
+
 async function persistRadioState(env, prevStartMs, state) {
   // optimistic concurrency: فقط اگه از وقتی این درخواست state رو خونده، کسِ دیگه‌ای زودتر جلوش
   // نبرده باشه (segment_start_ms هنوز همونیه که خوندیم) آپدیت می‌کنیم. اگه یه درخواستِ هم‌زمانِ
@@ -1663,20 +1701,44 @@ async function handleRadioNow(request, env) {
   let state = await loadRadioState(env);
   if (!state) state = await bootstrapRadioState(env, tracks, nowMs);
 
-  // اگه قسمتِ فعلی تموم شده، جلو می‌بریمش — ممکنه چند قدم پشتِ‌سرِهم لازم باشه (مثلاً سرور یه مدت
-  // هیچ درخواستی نداشته)؛ سقفِ ۲۰ قدم فقط برای جلوگیری از حلقه‌ی بی‌نهایتِ احتمالیه.
+  // اگه قسمتِ فعلی تموم شده، جلو می‌بریمش. برای وقفه‌های کوتاه (چند قسمت) مثلِ قبل قدم‌به‌قدم و با
+  // چکِ واقعیِ صفِ ویس جلو می‌ریم. ولی اگه سرور مدتِ طولانی‌ای (بیشتر از ۱۰ دقیقه) هیچ درخواستی
+  // نداشته، به‌جای صدها قدمِ پشتِ‌سرِهم (که هم به سقفِ subrequestِ ورکر می‌خورد هم چندین‌بار پشتِ‌سرِهم
+  // به کاربر «آهنگ عوض شد» نشون می‌داد بدونِ اینکه واقعاً چیزی پخش بشه)، یه جهشِ سریعِ تو-حافظه می‌زنیم.
+  const RADIO_FAST_FORWARD_THRESHOLD_MS = 10 * 60 * 1000;
+  const RADIO_VOICE_EXPIRE_MS = 10 * 60 * 1000;
   const startedAtMs = state.segment_start_ms;
-  let steps = 0;
-  while (nowMs >= state.segment_start_ms + state.segment_duration_seconds * 1000 && steps < 20) {
-    const segEnd = state.segment_start_ms + state.segment_duration_seconds * 1000;
-    state = await advanceRadioSegment(env, tracks, state, segEnd);
-    steps++;
-  }
-  if (steps > 0) {
+  const deficitMs = nowMs - (state.segment_start_ms + state.segment_duration_seconds * 1000);
+
+  if (deficitMs > RADIO_FAST_FORWARD_THRESHOLD_MS) {
+    // ویس‌های معلقِ خیلی قدیمی (مالِ قبلِ این وقفه‌ی طولانی) دیگه معنی نداره الان پخش بشن؛ منقضی‌شون کن
+    await env.D1.prepare(
+      "UPDATE radio_voice_queue SET status = 'expired' WHERE status = 'pending' AND created_at < ?"
+    ).bind(nowMs - RADIO_VOICE_EXPIRE_MS).run();
+    if (state.segment_type !== "song") {
+      // اگه دقیقاً وسطِ ویس/مکث گیر کرده بودیم، اول یه قدمِ معمولی تا برسیم به یه «آهنگ»، بعد جهشِ سریع
+      const segEnd = state.segment_start_ms + state.segment_duration_seconds * 1000;
+      state = await advanceRadioSegment(env, tracks, state, segEnd);
+    }
+    state = fastForwardSongOnly(tracks, state, nowMs);
     const persisted = await persistRadioState(env, startedAtMs, state);
     if (!persisted) {
       const fresh = await loadRadioState(env);
       if (fresh) state = fresh;
+    }
+  } else {
+    let steps = 0;
+    while (nowMs >= state.segment_start_ms + state.segment_duration_seconds * 1000 && steps < 20) {
+      const segEnd = state.segment_start_ms + state.segment_duration_seconds * 1000;
+      state = await advanceRadioSegment(env, tracks, state, segEnd);
+      steps++;
+    }
+    if (steps > 0) {
+      const persisted = await persistRadioState(env, startedAtMs, state);
+      if (!persisted) {
+        const fresh = await loadRadioState(env);
+        if (fresh) state = fresh;
+      }
     }
   }
 
