@@ -3579,6 +3579,50 @@ async function handleUserSearch(request, env) {
 //     title TEXT, file_id TEXT, acquired_at INTEGER NOT NULL
 //   );
 
+// یادداشتِ مایگریشن (یه‌بار توی D1 Console اجرا شه):
+//   CREATE TABLE birthday_claims (username TEXT PRIMARY KEY, claimed_at INTEGER NOT NULL);
+
+// پاپ‌آپِ تولدِ alucardswifey: وضعیتِ فعلیِ کاربر (که ببینه اصلاً باید پاپ‌آپ رو نشون بده یا نه).
+// عمداً سمتِ سرور چک می‌شه نه فقط localStorage، وگرنه با پاک‌کردنِ کش/عوض‌کردنِ مرورگر هر بار دوباره میاد.
+async function handleBirthdayStatus(request, env) {
+  const username = await getUserFromToken(request, env);
+  if (!username) return json({ error: "لطفاً وارد شو" }, 401);
+  const row = await env.D1.prepare("SELECT username FROM birthday_claims WHERE username = ?").bind(username).first();
+  return json({ ok: true, claimed: !!row });
+}
+
+// خوردنِ کیک: فقط یه‌بار برای هر کاربر جواب می‌ده؛ ۱۰ دهپوینت کم می‌کنه (حتی اگه منفی بشه، طبقِ
+// خواسته). ایمن دربرابرِ درخواستِ همزمان/تکراری: اگه قبلاً claim شده، دوباره کم نمی‌کنه.
+async function handleBirthdayClaim(request, env) {
+  const username = await getUserFromToken(request, env);
+  if (!username) return json({ error: "لطفاً وارد شو" }, 401);
+
+  const already = await env.D1.prepare("SELECT username FROM birthday_claims WHERE username = ?").bind(username).first();
+  if (already) {
+    const balRow = await env.D1.prepare("SELECT points FROM dehpoints WHERE username = ?").bind(username).first();
+    return json({ ok: true, alreadyClaimed: true, dehpoints: (balRow && balRow.points) || 0 });
+  }
+
+  const now = Date.now();
+  try {
+    await env.D1.batch([
+      env.D1.prepare("INSERT INTO birthday_claims (username, claimed_at) VALUES (?, ?)").bind(username, now),
+      env.D1.prepare(
+        `INSERT INTO dehpoints (username, points, updated_at) VALUES (?, -10, ?)
+         ON CONFLICT(username) DO UPDATE SET points = points - 10, updated_at = excluded.updated_at`
+      ).bind(username, now),
+    ]);
+  } catch (err) {
+    // اگه بینِ چکِ بالا و این batch یه درخواستِ همزمانِ دیگه زودتر claim کرده باشه (ریس‌کاندیشنِ نادر)،
+    // اینسرتِ birthday_claims با خطای PRIMARY KEY شکست می‌خوره؛ یعنی همین الان جای دیگه claim شده
+    const balRow = await env.D1.prepare("SELECT points FROM dehpoints WHERE username = ?").bind(username).first();
+    return json({ ok: true, alreadyClaimed: true, dehpoints: (balRow && balRow.points) || 0 });
+  }
+
+  const balRow = await env.D1.prepare("SELECT points FROM dehpoints WHERE username = ?").bind(username).first();
+  return json({ ok: true, dehpoints: (balRow && balRow.points) || 0 });
+}
+
 async function isChefUser(env, username) {
   if (isSuperAdmin(username)) return true; // مالکِ سایت خودش هم می‌تونه غذا سرو کنه
   const row = await env.D1.prepare("SELECT username FROM chefs WHERE username = ?").bind(username).first();
@@ -6980,6 +7024,12 @@ async function routeRequest(url, request, env, ctx) {
       }
       if (url.pathname === "/api/admin/chefs/remove" && request.method === "POST") {
         return await handleAdminChefRemove(request, env);
+      }
+      if (url.pathname === "/api/birthday/status" && request.method === "GET") {
+        return await handleBirthdayStatus(request, env);
+      }
+      if (url.pathname === "/api/birthday/claim" && request.method === "POST") {
+        return await handleBirthdayClaim(request, env);
       }
       if (url.pathname === "/api/restaurant/chef-status" && request.method === "GET") {
         return await handleChefStatus(request, env);
