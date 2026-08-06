@@ -3919,6 +3919,7 @@ async function handleGetProfile(request, env) {
       banner_file_id: (profile && profile.banner_file_id) || null,
       chat_bg_file_id: (profile && profile.chat_bg_file_id) || null,
       theme: normalizeThemeValue((profile && profile.theme) || "purple-dark"),
+      font: normalizeFontValue(profile && profile.font),
       total_upvotes: (totals && totals.totalUpvotes) || 0,
       total_likes: (totals && totals.totalLikes) || 0,
       reported_by_me: reportedByMe,
@@ -3941,6 +3942,38 @@ const LEGACY_THEME_MAP = { purple: "purple-dark", dark: "walnut-dark", red: "red
 function normalizeThemeValue(theme) {
   if (!theme) return "purple-dark";
   return LEGACY_THEME_MAP[theme] || theme;
+}
+
+// ---------- فونتِ سایت (مستقل از تم رنگی) ----------
+// یادداشت مایگریشن (یه‌بار توی D1 Console اجرا شه):
+//   ALTER TABLE profiles ADD COLUMN font TEXT;
+const VALID_FONTS = ["vazirmatn", "plex", "handjet"];
+function normalizeFontValue(font) {
+  return VALID_FONTS.includes(font) ? font : "vazirmatn";
+}
+
+async function handleUpdateFont(request, env) {
+  const username = await getUserFromToken(request, env);
+  if (!username) return json({ error: "ابتدا وارد شو" }, 401);
+
+  let body;
+  try {
+    body = await request.json();
+  } catch (e) {
+    return json({ error: "درخواست نامعتبره" }, 400);
+  }
+
+  const font = (body.font || "").toString();
+  if (!VALID_FONTS.includes(font)) {
+    return json({ error: "فونت نامعتبره" }, 400);
+  }
+
+  await env.D1.prepare(
+    `INSERT INTO profiles (username, bio, avatar_file_id, banner_file_id, font, theme, updated_at) VALUES (?, '', NULL, NULL, ?, ?, ?)
+     ON CONFLICT(username) DO UPDATE SET font = excluded.font, updated_at = excluded.updated_at`
+  ).bind(username, font, "purple-dark", Date.now()).run();
+
+  return json({ ok: true, font });
 }
 
 async function handleUpdateTheme(request, env) {
@@ -4173,7 +4206,9 @@ async function handleBootstrap(request, env) {
     profile: {
       username,
       avatar_file_id: (profileRow && profileRow.avatar_file_id) || null,
+      chat_bg_file_id: (profileRow && profileRow.chat_bg_file_id) || null,
       theme: normalizeThemeValue((profileRow && profileRow.theme) || "purple-dark"),
+      font: normalizeFontValue(profileRow && profileRow.font),
     },
     unread_notifications: (unreadRow && unreadRow.c) || 0,
     feed: feedResult,
@@ -7085,6 +7120,9 @@ async function routeRequest(url, request, env, ctx) {
       }
       if (url.pathname === "/api/theme" && request.method === "POST") {
         return await handleUpdateTheme(request, env);
+      }
+      if (url.pathname === "/api/font" && request.method === "POST") {
+        return await handleUpdateFont(request, env);
       }
       if (url.pathname === "/api/admin/me" && request.method === "GET") {
         return await handleAdminMe(request, env);
