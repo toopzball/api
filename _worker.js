@@ -545,6 +545,71 @@ async function getUserPresence(env, username) {
 const ONLINE_WINDOW_MS = 45000; // اگه توی ۴۵ ثانیه‌ی اخیر فعالیتی ثبت شده باشه، «آنلاین» نشون داده می‌شه
 
 // #endregion
+// #region اندپوینتِ داخلی: پوش‌نوتیفیکیشنِ دعوتِ دوز (صدا زده می‌شه توسطِ ورکرِ جدایِ deh-games)
+// این مسیر با همون X-Internal-Key محافظت می‌شه که پروکسیِ Pages ازش استفاده می‌کنه؛ یعنی هیچ
+// کلید/سکرتِ جدیدی لازم نیست، فقط باید همین مقدار رو تو env.INTERNAL_KEY ورکرِ deh-games هم ست کنی.
+async function handleDoozInvitePush(request, env) {
+  const internalKey = request.headers.get("X-Internal-Key");
+  if (!env.INTERNAL_KEY || internalKey !== env.INTERNAL_KEY) {
+    return json({ error: "دسترسی نداری" }, 403);
+  }
+  const body = await request.json().catch(() => ({}));
+  const toUsername = (body.toUsername || "").trim();
+  const fromUsername = (body.fromUsername || "").trim();
+  if (!toUsername || !fromUsername) return json({ error: "پارامترها ناقصه" }, 400);
+
+  const pushPayload = {
+    title: "دهات",
+    body: `${fromUsername} دعوتت کرد به بازیِ دوز`,
+    url: `${SITE_ORIGIN}/index.html`,
+    tag: `dooz-invite-${fromUsername}`,
+  };
+  await Promise.all([
+    sendPushToUser(env, toUsername, pushPayload),
+    sendFcmToUser(env, toUsername, pushPayload),
+  ]);
+  return json({ ok: true });
+}
+// #endregion
+// ---------- لیستِ کاربرانِ آنلاین ----------
+// صفحه‌بندی با offset ساده‌ست چون این لیست مرتب تغییر می‌کنه (based on لیزی‌لودِ اسکرول، نه URLِ قابلِ بوکمارک)
+async function handleOnlineUsers(request, env) {
+  const username = await getUserFromToken(request, env);
+  if (!username) return json({ error: "ابتدا وارد شو" }, 401);
+  touchUserPresence(env, username).catch(() => {});
+
+  const url = new URL(request.url);
+  const limitParam = parseInt(url.searchParams.get("limit") || "20", 10);
+  const limit = Number.isFinite(limitParam) ? Math.min(Math.max(limitParam, 1), 50) : 20;
+  const offsetParam = parseInt(url.searchParams.get("offset") || "0", 10);
+  const offset = Number.isFinite(offsetParam) && offsetParam >= 0 ? offsetParam : 0;
+
+  const cutoff = Date.now() - ONLINE_WINDOW_MS;
+  let rows = [];
+  try {
+    const res = await env.D1.prepare(
+      `SELECT up.username AS username, up.last_active_at AS lastActiveAt, p.avatar_file_id AS avatarFileId
+       FROM user_presence up
+       LEFT JOIN profiles p ON p.username = up.username
+       WHERE up.last_active_at >= ? AND up.username != ?
+       ORDER BY up.last_active_at DESC
+       LIMIT ? OFFSET ?`
+    ).bind(cutoff, username, limit + 1, offset).all();
+    rows = res.results || [];
+  } catch (e) {
+    rows = [];
+  }
+
+  const hasMore = rows.length > limit;
+  const page = rows.slice(0, limit).map((r) => ({
+    username: r.username,
+    avatarFileId: r.avatarFileId || null,
+    lastActiveAt: r.lastActiveAt,
+  }));
+
+  return json({ ok: true, users: page, hasMore, nextOffset: offset + page.length });
+}
+// #endregion
 // #region تشخیص واقعیِ نوع فایل از روی بایت‌های اول (Magic Bytes)
 // ---------- تشخیص واقعیِ نوع فایل از روی بایت‌های اول (Magic Bytes) ----------
 // به Content-Type اعلام‌شده توسط مرورگر به‌تنهایی اعتماد نمی‌کنیم؛ چون یه درخواست دستی (مثلاً با curl، نه از
@@ -7176,6 +7241,12 @@ async function routeRequest(url, request, env, ctx) {
       }
       if (url.pathname === "/api/chat/members" && request.method === "GET") {
         return await handleChatMembers(request, env);
+      }
+      if (url.pathname === "/api/presence/online" && request.method === "GET") {
+        return await handleOnlineUsers(request, env);
+      }
+      if (url.pathname === "/api/internal/dooz-invite-push" && request.method === "POST") {
+        return await handleDoozInvitePush(request, env);
       }
       if (url.pathname === "/api/chat/group/update" && request.method === "POST") {
         return await handleChatUpdateGroup(request, env);
