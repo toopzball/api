@@ -466,11 +466,18 @@ async function handleDeleteFcmToken(request, env) {
 // #endregion
 // #region هش کردن پسورد (PBKDF2)
 // ---------- هش کردن پسورد (PBKDF2) ----------
-async function hashPassword(password, saltHex) {
+async function hashPassword(password, saltHex, env) {
   const enc = new TextEncoder();
+  // پپر: یه رشته‌ی مخفیِ ثابت که فقط تو Cloudflare Secrets (env.PASSWORD_PEPPER) نگه‌داری می‌شه،
+  // نه تو D1. اگه یه روز کل جدولِ users (salt+hash) لو بره، بدونِ دونستنِ پپر، مهاجم اصلاً نمی‌تونه
+  // فرمولِ هش رو کامل بازسازی کنه و بروت‌فورس رو شروع کنه؛ چون پپر جزوِ ورودیِ PBKDF2 هست ولی
+  // هیچ‌جای دیتابیس ذخیره نمی‌شه. اگه env.PASSWORD_PEPPER ست نشده باشه، برای سازگاری با عقب
+  // (قبل از اضافه‌شدنِ این قابلیت) از رشته‌ی خالی استفاده می‌شه.
+  const pepper = (env && env.PASSWORD_PEPPER) || "";
+  const peppered = password + pepper;
   const keyMaterial = await crypto.subtle.importKey(
     "raw",
-    enc.encode(password),
+    enc.encode(peppered),
     { name: "PBKDF2" },
     false,
     ["deriveBits"]
@@ -958,7 +965,7 @@ async function handleRegister(request, env) {
   }
 
   const salt = randomHex(16);
-  const hash = await hashPassword(password, salt);
+  const hash = await hashPassword(password, salt, env);
   const now = Date.now();
   await bind(
     env.D1.prepare(
@@ -1053,7 +1060,7 @@ async function handleLogin(request, env) {
     return json({ error: "نام کاربری یا رمز اشتباهه" }, 401);
   }
 
-  const attemptHash = await hashPassword(password, userData.salt);
+  const attemptHash = await hashPassword(password, userData.salt, env);
   if (attemptHash !== userData.hash) {
     await registerFailedLogin(env, username);
     return json({ error: "نام کاربری یا رمز اشتباهه" }, 401);
@@ -3705,6 +3712,8 @@ async function handleUserSearch(request, env) {
 //     id TEXT PRIMARY KEY, username TEXT NOT NULL, restaurant_item_id TEXT NOT NULL,
 //     title TEXT, file_id TEXT, acquired_at INTEGER NOT NULL
 //   );
+//   ALTER TABLE fridge_items ADD COLUMN price_points INTEGER;
+//   ALTER TABLE fridge_items ADD COLUMN description TEXT;
 
 // یادداشتِ مایگریشن (یه‌بار توی D1 Console اجرا شه):
 //   CREATE TABLE birthday_claims (username TEXT PRIMARY KEY, claimed_at INTEGER NOT NULL);
@@ -3831,8 +3840,8 @@ async function handleRestaurantBuy(request, env) {
        ON CONFLICT(username) DO UPDATE SET points = points + excluded.points, updated_at = excluded.updated_at`
     ).bind(SUPER_ADMIN_USERNAME, adminShare, now),
     env.D1.prepare(
-      "INSERT INTO fridge_items (id, username, restaurant_item_id, title, file_id, acquired_at) VALUES (?, ?, ?, ?, ?, ?)"
-    ).bind(fridgeId, username, item.id, item.title, item.file_id, now),
+      "INSERT INTO fridge_items (id, username, restaurant_item_id, title, file_id, acquired_at, price_points, description) VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
+    ).bind(fridgeId, username, item.id, item.title, item.file_id, now, item.price_points, item.description || null),
   ]);
 
   return json({ ok: true });
@@ -3842,7 +3851,7 @@ async function handleRestaurantFridge(request, env) {
   const username = await getUserFromToken(request, env);
   if (!username) return json({ error: "لطفاً وارد شو" }, 401);
   const rows = await env.D1.prepare(
-    "SELECT id, title, file_id, acquired_at FROM fridge_items WHERE username = ? ORDER BY acquired_at DESC"
+    "SELECT id, title, file_id, acquired_at, price_points, description FROM fridge_items WHERE username = ? ORDER BY acquired_at DESC"
   )
     .bind(username)
     .all();
@@ -4385,7 +4394,7 @@ async function handleAdminChangePassword(request, env) {
   if (!existing) return json({ error: "کاربر پیدا نشد" }, 404);
 
   const newSalt = randomHex(16);
-  const newHash = await hashPassword(newPassword, newSalt);
+  const newHash = await hashPassword(newPassword, newSalt, env);
   await env.D1.prepare("UPDATE users SET salt = ?, hash = ? WHERE username = ?").bind(newSalt, newHash, targetUsername).run();
 
   // با تغییرِ رمز توسط مالک سایت، همه‌ی سشن‌های فعلیِ اون کاربر باطل می‌شه تا با رمزِ جدید دوباره وارد بشه
@@ -4393,6 +4402,75 @@ async function handleAdminChangePassword(request, env) {
   await kvDelete(env, `pwd_fails:${targetUsername}`);
 
   return json({ ok: true, targetUsername });
+}
+
+// #endregion
+// #region تعویضِ دستیِ رمزِ همه‌ی کاربرها (اقدامِ اضطراری، فقط مالک سایت)
+// ---------- تعویضِ دستیِ رمزِ همه‌ی کاربرها ----------
+// برای شرایطی که احتمالِ لو رفتنِ رمزها (چه هش‌شده چه پلین) وجود داره: برای هر کاربر (به‌جز
+// خودِ Aghey) یه رمزِ تصادفیِ جدید می‌سازه، هش می‌کنه و جایگزینِ رمزِ قبلی می‌کنه، همه‌ی سشن‌های
+// فعالِ همه رو باطل می‌کنه، و لیستِ «نام‌کاربری => رمزِ جدید» رو برمی‌گردونه تا مالک سایت دستی
+// (مثلاً یکی‌یکی تو تلگرام) به هر کاربر برسونتش. رمزِ جدید هیچ‌وقت جایی ذخیره نمی‌شه؛ فقط همین
+// یه بار تو پاسخِ همین درخواست برمی‌گرده، پس اگه گم بشه باید دوباره اجرا بشه.
+function generateRandomPassword() {
+  // ترکیبِ حروف و عدد که با PASSWORD_RE (حداقل ۸ کاراکتر، حداقل یه حرف و یه عدد) سازگاره
+  const chars = "ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnpqrstuvwxyz23456789";
+  const bytes = new Uint8Array(12);
+  crypto.getRandomValues(bytes);
+  let pass = "";
+  for (let i = 0; i < bytes.length; i++) pass += chars[bytes[i] % chars.length];
+  return pass;
+}
+
+async function handleAdminResetAllPasswords(request, env) {
+  const username = await getUserFromToken(request, env);
+  if (!username) return json({ error: "ابتدا وارد شو" }, 401);
+  if (!isSuperAdmin(username)) {
+    return json({ error: "فقط مالک سایت می‌تونه این کار رو انجام بده" }, 403);
+  }
+
+  let body = {};
+  try {
+    body = await request.json();
+  } catch (e) {
+    body = {};
+  }
+  // برای جلوگیری از اجرای تصادفی/اشتباهی، باید صریحاً تایید بفرسته
+  if (body.confirm !== "RESET_ALL_PASSWORDS") {
+    return json({ error: "برای تاییدِ این عملیاتِ برگشت‌ناپذیر، confirm رو برابرِ RESET_ALL_PASSWORDS بفرست" }, 400);
+  }
+
+  const { results } = await env.D1
+    .prepare("SELECT username FROM users WHERE username != ?")
+    .bind(SUPER_ADMIN_USERNAME)
+    .all();
+
+  const changed = [];
+  for (const row of results) {
+    const newPassword = generateRandomPassword();
+    const newSalt = randomHex(16);
+    const newHash = await hashPassword(newPassword, newSalt, env);
+    await env.D1
+      .prepare("UPDATE users SET salt = ?, hash = ? WHERE username = ?")
+      .bind(newSalt, newHash, row.username)
+      .run();
+    changed.push({ username: row.username, newPassword });
+  }
+
+  // باطل کردنِ همه‌ی سشن‌های فعال (به‌جز سشنِ همینِ درخواست، که مالِ خودِ Aghey‌ست)
+  const authHeader = request.headers.get("Authorization") || "";
+  const currentToken = authHeader.startsWith("Bearer ") ? authHeader.slice(7) : null;
+  if (currentToken) {
+    await env.D1.prepare("DELETE FROM sessions WHERE token != ?").bind(currentToken).run();
+  } else {
+    await env.D1.prepare("DELETE FROM sessions").run();
+  }
+
+  // یه نسخه‌ی متنیِ ساده هم می‌سازیم (هر خط: نام‌کاربری: رمزِ جدید) تا رو موبایل راحت کپی بشه،
+  // چون خوندن/کپی‌کردن از داخلِ آرایه‌ی JSON رو گوشی دردسرِ زیادی داره
+  const list = changed.map((c) => `${c.username}: ${c.newPassword}`).join("\n");
+
+  return json({ ok: true, count: changed.length, users: changed, list });
 }
 
 // #endregion
@@ -6758,7 +6836,7 @@ async function handlePasswordVerify(request, env) {
   const userData = await env.D1.prepare("SELECT salt, hash FROM users WHERE username = ?").bind(username).first();
   if (!userData) return json({ error: "کاربر پیدا نشد" }, 404);
 
-  const attemptHash = await hashPassword(currentPassword, userData.salt);
+  const attemptHash = await hashPassword(currentPassword, userData.salt, env);
   if (attemptHash !== userData.hash) {
     await registerFailedPasswordAttempt(env, username);
     return json({ error: "رمز عبور فعلی اشتباهه" }, 401);
@@ -6793,7 +6871,7 @@ async function handleChangePassword(request, env) {
   const userData = await env.D1.prepare("SELECT salt, hash FROM users WHERE username = ?").bind(username).first();
   if (!userData) return json({ error: "کاربر پیدا نشد" }, 404);
 
-  const attemptHash = await hashPassword(currentPassword, userData.salt);
+  const attemptHash = await hashPassword(currentPassword, userData.salt, env);
   if (attemptHash !== userData.hash) {
     await registerFailedPasswordAttempt(env, username);
     return json({ error: "رمز عبور فعلی اشتباهه" }, 401);
@@ -6808,7 +6886,7 @@ async function handleChangePassword(request, env) {
   }
 
   const newSalt = randomHex(16);
-  const newHash = await hashPassword(newPassword, newSalt);
+  const newHash = await hashPassword(newPassword, newSalt, env);
   await env.D1.prepare("UPDATE users SET salt = ?, hash = ? WHERE username = ?").bind(newSalt, newHash, username).run();
 
   // بعد از تغییر موفق رمز، همه‌ی سشن‌های دیگه (روی گوشی/مرورگرهای دیگه) باطل می‌شن؛ فقط همینی که
@@ -7168,6 +7246,9 @@ async function routeRequest(url, request, env, ctx) {
       }
       if (url.pathname === "/api/admin/change-password" && request.method === "POST") {
         return await handleAdminChangePassword(request, env);
+      }
+      if (url.pathname === "/api/admin/reset-all-passwords" && request.method === "POST") {
+        return await handleAdminResetAllPasswords(request, env);
       }
       if (url.pathname === "/api/admin/delete-account" && request.method === "POST") {
         return await handleAdminDeleteAccount(request, env);
