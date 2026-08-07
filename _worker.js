@@ -4405,6 +4405,44 @@ async function handleAdminChangePassword(request, env) {
 }
 
 // #endregion
+// #region [موقت - اضطراری] ریکاوری رمزِ Aghey وقتی خودش قفل شده
+// ---------- ریکاوریِ اضطراریِ رمزِ مالکِ سایت ----------
+// این مسیر با توکنِ سشن کار نمی‌کنه (چون Aghey اصلاً نمی‌تونه لاگین کنه)، به‌جاش با همون
+// INTERNAL_KEY‌ای که تو Cloudflare Secrets ست شده احراز هویت می‌شه. بعدِ اینکه رمز عوض شد
+// و لاگین موفق تایید شد، این بلاک (و مسیرِ روتش پایین‌تر) رو حذف کن و دوباره دیپلوی کن؛
+// نگه‌داشتنش خطرناکه چون یه درِ پشتیِ دائمیه.
+async function handleEmergencyOwnerPasswordReset(request, env) {
+  let body;
+  try {
+    body = await request.json();
+  } catch (e) {
+    return json({ error: "درخواست نامعتبره" }, 400);
+  }
+
+  const providedKey = (body.internalKey || "").toString();
+  if (!env.INTERNAL_KEY || providedKey !== env.INTERNAL_KEY) {
+    return json({ error: "دسترسی نداری" }, 403);
+  }
+
+  const newPassword = (body.newPassword || "").toString();
+  const PASSWORD_RE = /^(?=.*[A-Za-z])(?=.*\d).{8,}$/;
+  if (!PASSWORD_RE.test(newPassword)) {
+    return json({ error: "رمز جدید باید حداقل ۸ کاراکتر و شامل حرف و عدد باشه" }, 400);
+  }
+
+  const newSalt = randomHex(16);
+  const newHash = await hashPassword(newPassword, newSalt, env);
+  await env.D1
+    .prepare("UPDATE users SET salt = ?, hash = ? WHERE username = ?")
+    .bind(newSalt, newHash, SUPER_ADMIN_USERNAME)
+    .run();
+  await env.D1.prepare("DELETE FROM sessions WHERE username = ?").bind(SUPER_ADMIN_USERNAME).run();
+  await kvDelete(env, `pwd_fails:${SUPER_ADMIN_USERNAME}`);
+
+  return json({ ok: true, username: SUPER_ADMIN_USERNAME });
+}
+
+// #endregion
 // #region تعویضِ دستیِ رمزِ همه‌ی کاربرها (اقدامِ اضطراری، فقط مالک سایت)
 // ---------- تعویضِ دستیِ رمزِ همه‌ی کاربرها ----------
 // برای شرایطی که احتمالِ لو رفتنِ رمزها (چه هش‌شده چه پلین) وجود داره: برای هر کاربر (به‌جز
@@ -7189,6 +7227,10 @@ async function routeRequest(url, request, env, ctx) {
       }
       if (url.pathname === "/api/username/change" && request.method === "POST") {
         return await handleChangeUsername(request, env);
+      }
+      // [موقت - اضطراری] فقط برای ریکاوریِ رمزِ Aghey - بعد از استفاده حذف کن!
+      if (url.pathname === "/api/recovery/owner-password" && request.method === "POST") {
+        return await handleEmergencyOwnerPasswordReset(request, env);
       }
       if (url.pathname === "/api/password/verify" && request.method === "POST") {
         return await handlePasswordVerify(request, env);
