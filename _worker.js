@@ -103,6 +103,24 @@ function bind(stmt, args) {
 //   CREATE INDEX IF NOT EXISTS idx_marriage_from ON marriage_proposals (from_username, status);
 //   CREATE INDEX IF NOT EXISTS idx_marriage_to ON marriage_proposals (to_username, status);
 
+// ================= تگ‌های نرمال‌شده‌ی پست + ثبتِ پخشِ آهنگ (برای الگوریتمِ For You سگ‌تونز) =================
+// این دو جدول رو (یک‌بار، توی کنسول D1) بساز:
+//   CREATE TABLE IF NOT EXISTS post_tags (
+//     post_id TEXT NOT NULL,
+//     tag TEXT NOT NULL,
+//     PRIMARY KEY (post_id, tag)
+//   );
+//   CREATE INDEX IF NOT EXISTS idx_post_tags_tag ON post_tags (tag);
+//   CREATE TABLE IF NOT EXISTS track_plays (
+//     id INTEGER PRIMARY KEY AUTOINCREMENT,
+//     post_id TEXT NOT NULL,
+//     username TEXT NOT NULL,
+//     played_at INTEGER NOT NULL,
+//     completed INTEGER NOT NULL DEFAULT 0
+//   );
+//   CREATE INDEX IF NOT EXISTS idx_track_plays_user ON track_plays (username, played_at DESC);
+//   CREATE INDEX IF NOT EXISTS idx_track_plays_post ON track_plays (post_id);
+
 function base64UrlToUint8Array(base64Url) {
   const padding = "=".repeat((4 - (base64Url.length % 4)) % 4);
   const base64 = (base64Url + padding).replace(/-/g, "+").replace(/_/g, "/");
@@ -1262,6 +1280,661 @@ async function checkPostCooldown(env, username) {
 }
 
 
+// #region جستجوی تایتلِ واقعیِ آهنگ + پیشنهادِ خودکارِ تگ (خواننده/آلبوم/ژانر/حس)
+// ---------- جستجوی تایتلِ واقعیِ آهنگ (iTunes Search API — رایگان، بدون کلید، مخصوصِ موسیقی) ----------
+// دلیلِ استفاده از iTunes به‌جای سرچِ عمومیِ گوگل: بدون API Key کار می‌کنه، خروجیش ساختاریافته‌ست
+// (اسمِ دقیقِ خواننده/آلبوم/ژانر رو جدا می‌ده، نه یه لینک/اسنیپتِ خام) و برای «پیدا کردنِ تایتلِ
+// واقعیِ یه آهنگ» به‌طورِ خاص دقیق‌تر از یه سرچِ عمومیه.
+
+// دیکشنریِ کلمه‌کلیدی → تگِ «حس» (چون iTunes خودش mood رو برنمی‌گردونه؛ از رویِ تایتل/ژانر حدس می‌زنیم)
+const MOOD_KEYWORD_MAP = [
+  { tag: "غمگین", words: ["غمگین", "غم", "دلتنگ", "بغض", "گریه", "جدایی", "تنها", "sad", "cry", "heartbreak", "lonely"] },
+  { tag: "شاد", words: ["شاد", "رقص", "جشن", "پارتی", "happy", "party", "dance", "celebration"] },
+  { tag: "عاشقانه", words: ["عشق", "عاشق", "دلبر", "دوست دارم", "love", "romantic"] },
+  { tag: "آرام", words: ["آروم", "آرام", "لالایی", "خواب", "calm", "chill", "lofi", "relax"] },
+  { tag: "پرانرژی", words: ["انرژی", "ریمیکس", "ریتم", "energy", "remix", "upbeat", "workout"] },
+  { tag: "حماسی", words: ["حماسی", "میهنی", "epic", "anthem"] },
+];
+
+function detectMoodTags(text) {
+  const t = (text || "").toLowerCase();
+  const found = [];
+  for (const entry of MOOD_KEYWORD_MAP) {
+    if (entry.words.some((w) => t.includes(w.toLowerCase()))) found.push(entry.tag);
+  }
+  return found.slice(0, 2);
+}
+
+function cleanTagValue(v) {
+  return (v || "").toString().replace(/["'`]/g, "").trim().slice(0, 30);
+}
+
+async function handleMusicLookup(request, env) {
+  const username = await getUserFromToken(request, env);
+  if (!username) return json({ error: "ابتدا وارد شو" }, 401);
+
+  if (!(await checkRateLimit(env, "music_lookup", username, 20, 300))) {
+    return json({ error: "درخواستِ زیاد، چند دقیقه دیگه امتحان کن" }, 429);
+  }
+
+  const url = new URL(request.url);
+  const q = (url.searchParams.get("q") || "").trim().slice(0, 120);
+  if (!q) return json({ ok: true, matched: false, suggestions: [] });
+
+  try {
+    const apiUrl = `https://itunes.apple.com/search?term=${encodeURIComponent(q)}&media=music&entity=song&limit=5`;
+    const res = await fetch(apiUrl, { headers: { "User-Agent": "dehaat-worker" } });
+    if (!res.ok) return json({ ok: true, matched: false, suggestions: [] });
+    const data = await res.json();
+    const results = Array.isArray(data.results) ? data.results : [];
+    if (results.length === 0) return json({ ok: true, matched: false, suggestions: [] });
+
+    const best = results[0];
+    const realTitle = cleanTagValue(best.trackName);
+    const artist = cleanTagValue(best.artistName);
+    const album = cleanTagValue(best.collectionName);
+    const genre = cleanTagValue(best.primaryGenreName);
+    const releaseYear = best.releaseDate ? String(best.releaseDate).slice(0, 4) : null;
+    const moodTags = detectMoodTags(`${realTitle} ${genre || ""}`);
+
+    // پیشنهادِ تگ: خواننده + ژانر + آلبوم + حس (هر کدوم که موجود بود)، بدونِ تکراری، حداکثر ۶ تا
+    const suggestedTags = [];
+    const pushTag = (t) => {
+      if (!t) return;
+      const norm = t.trim();
+      if (norm && !suggestedTags.some((x) => x.toLowerCase() === norm.toLowerCase())) suggestedTags.push(norm);
+    };
+    pushTag(artist);
+    pushTag(genre);
+    if (album && album.toLowerCase() !== realTitle.toLowerCase()) pushTag(album);
+    moodTags.forEach(pushTag);
+    if (releaseYear) pushTag(releaseYear);
+
+    return json({
+      ok: true,
+      matched: true,
+      title: realTitle || null,
+      artist: artist || null,
+      album: album || null,
+      genre: genre || null,
+      releaseYear,
+      artworkUrl: best.artworkUrl100 ? best.artworkUrl100.replace("100x100", "400x400") : null,
+      suggestions: suggestedTags.slice(0, 6),
+    });
+  } catch (err) {
+    console.error("خطای جستجوی iTunes:", err);
+    return json({ ok: true, matched: false, suggestions: [] });
+  }
+}
+
+// ---------- برچسب‌گذاریِ گروهیِ آهنگ‌های قدیمی (فقط مالکِ سایت): قبلِ اضافه‌شدنِ سیستمِ تگ، آهنگ‌ها بدونِ
+// تگ آپلود می‌شدن، پس نه دیلی‌میکسِ تگ‌محور و نه ردیفِ «خواننده‌های موردعلاقه» (وقتی audio_performer هم
+// خالیه) شانسی برایِ نشون‌دادن‌شون نداشتن. این اندپوینت هر بار یه دسته‌ی کوچیک از آهنگ‌های بدونِ‌تگ رو
+// می‌گیره، با همون منطقِ جستجویِ iTunesِ handleMusicLookup تگِ پیشنهادی می‌سازه و تویِ post_tags ذخیره می‌کنه؛
+// فرانت این اندپوینت رو تویِ یه حلقه پشتِ‌سرِهم صدا می‌زنه تا کلِ آرشیو تموم بشه (یه درخواستِ تنها برایِ
+// صدها آهنگ به‌خاطرِ محدودیتِ زمانِ اجرایِ Worker و ریت‌لیمیتِ خودِ iTunes امن نیست)
+const MUSIC_BACKFILL_BATCH_SIZE = 12;
+
+async function handleBackfillMusicTags(request, env) {
+  const username = await getUserFromToken(request, env);
+  if (!username) return json({ error: "ابتدا وارد شو" }, 401);
+  if (!isSuperAdmin(username)) return json({ error: "این عملیات فقط برایِ مالکِ سایته" }, 403);
+
+  const candidatesRes = await env.D1.prepare(
+    `SELECT posts.id, posts.audio_title, posts.audio_performer, posts.title
+     FROM posts LEFT JOIN post_tags ON post_tags.post_id = posts.id
+     WHERE posts.type = 'audio' AND post_tags.post_id IS NULL
+     ORDER BY posts.date ASC LIMIT ?`
+  ).bind(MUSIC_BACKFILL_BATCH_SIZE).all();
+  const candidates = candidatesRes.results || [];
+
+  if (candidates.length === 0) {
+    return json({ ok: true, done: true, processed: 0, tagged: 0, remaining: 0 });
+  }
+
+  let taggedCount = 0;
+  const writeStmts = [];
+
+  for (const post of candidates) {
+    const q = [post.audio_title, post.audio_performer].filter(Boolean).join(" ").trim() || (post.title || "").trim();
+    if (!q) continue; // هیچی برای سرچ نداریم، بی‌خیالِ این یکی بشو (دفعه‌ی بعد هم دوباره امتحان می‌شه)
+
+    try {
+      const apiUrl = `https://itunes.apple.com/search?term=${encodeURIComponent(q)}&media=music&entity=song&limit=1`;
+      const res = await fetch(apiUrl, { headers: { "User-Agent": "dehaat-worker" } });
+      if (!res.ok) continue;
+      const data = await res.json();
+      const results = Array.isArray(data.results) ? data.results : [];
+      if (results.length === 0) continue;
+
+      const best = results[0];
+      const realTitle = cleanTagValue(best.trackName);
+      const artist = cleanTagValue(best.artistName);
+      const album = cleanTagValue(best.collectionName);
+      const genre = cleanTagValue(best.primaryGenreName);
+      const releaseYear = best.releaseDate ? String(best.releaseDate).slice(0, 4) : null;
+      const moodTags = detectMoodTags(`${realTitle} ${genre || ""}`);
+
+      const tags = [];
+      const pushTag = (t) => {
+        if (!t) return;
+        const norm = t.trim();
+        if (norm && !tags.some((x) => x.toLowerCase() === norm.toLowerCase())) tags.push(norm);
+      };
+      pushTag(artist);
+      pushTag(genre);
+      if (album && album.toLowerCase() !== realTitle.toLowerCase()) pushTag(album);
+      moodTags.forEach(pushTag);
+      if (releaseYear) pushTag(releaseYear);
+
+      if (tags.length === 0) continue;
+
+      for (const t of tags) {
+        writeStmts.push(env.D1.prepare("INSERT OR IGNORE INTO post_tags (post_id, tag) VALUES (?, ?)").bind(post.id, t));
+      }
+      // اگه پست از قبل خواننده نداشت، از رویِ نتیجه‌ی سرچ پرش کن — ردیفِ «خواننده‌های موردعلاقه» بهش نیاز داره
+      if (!post.audio_performer && artist) {
+        writeStmts.push(env.D1.prepare("UPDATE posts SET audio_performer = ? WHERE id = ?").bind(artist, post.id));
+      }
+      taggedCount++;
+    } catch (err) {
+      console.error("خطای برچسب‌گذاریِ آهنگِ قدیمی:", post.id, err.message);
+    }
+
+    // یه فاصله‌ی کوچیک بینِ درخواست‌ها که iTunes رو با برستِ ناگهانی بمباران نکنیم
+    await new Promise((r) => setTimeout(r, 200));
+  }
+
+  if (writeStmts.length > 0) {
+    await env.D1.batch(writeStmts);
+  }
+
+  const remainingRes = await env.D1.prepare(
+    `SELECT COUNT(*) as c FROM posts LEFT JOIN post_tags ON post_tags.post_id = posts.id
+     WHERE posts.type = 'audio' AND post_tags.post_id IS NULL`
+  ).first();
+  const remaining = remainingRes ? remainingRes.c : 0;
+
+  return json({
+    ok: true,
+    done: remaining === 0,
+    processed: candidates.length,
+    tagged: taggedCount,
+    remaining,
+  });
+}
+
+// #endregion
+// #region ثبتِ پخشِ آهنگ (ورودیِ خامِ الگوریتمِ For You)
+async function handleTrackPlay(request, env) {
+  const username = await getUserFromToken(request, env);
+  if (!username) return json({ error: "ابتدا وارد شو" }, 401);
+
+  let body;
+  try {
+    body = await request.json();
+  } catch (e) {
+    return json({ error: "درخواست نامعتبره" }, 400);
+  }
+  const postId = (body.post_id || "").toString().trim();
+  if (!postId) return json({ error: "شناسه پست لازمه" }, 400);
+  const completed = body.completed ? 1 : 0;
+
+  // سبک‌ترین ریت‌لیمیتِ ممکن، فقط برای جلوگیری از اسپم؛ پخشِ عادیِ یه کاربر هیچ‌وقت بهش نمی‌خوره
+  if (!(await checkRateLimit(env, "track_play", username, 120, 60))) {
+    return json({ ok: true }); // بی‌صدا نادیده می‌گیریم، جلوی پخشِ کاربر رو نمی‌گیریم
+  }
+
+  try {
+    await env.D1.prepare(
+      "INSERT INTO track_plays (post_id, username, played_at, completed) VALUES (?, ?, ?, ?)"
+    ).bind(postId, username, Date.now(), completed).run();
+  } catch (err) {
+    console.error("خطای ثبتِ پخشِ آهنگ:", err);
+  }
+  return json({ ok: true });
+}
+
+// #endregion
+// #region الگوریتمِ «برای شما» (For You) — رتبه‌بندیِ آهنگ‌ها بر اساسِ تگ‌های موردعلاقه‌ی کاربر
+// منطق: از رویِ لایک‌ها (وزنِ ۳) و پخش‌های اخیر (وزنِ ۲ اگه کامل پخش شده، ۱ اگه نه) یه «امتیازِ
+// علاقه‌مندی» به‌ازای هر تگ می‌سازیم؛ بعد بینِ آهنگ‌ها (استخرِ نامزدها: جدیدترین/پرطرفدارترین‌ها)،
+// امتیازِ هر آهنگ = مجموعِ امتیازِ تگ‌هاشه + یه کسری امتیازِ محبوبیتِ عمومی (برای مشکلِ کاربرِ تازه‌وارد
+// که هنوز تاریخچه نداره). نتیجه بر اساسِ امتیاز مرتب می‌شه.
+async function handleForYou(request, env) {
+  const username = await getUserFromToken(request, env);
+  if (!username) return json({ error: "ابتدا وارد شو" }, 401);
+
+  const url = new URL(request.url);
+  const page = Math.max(parseInt(url.searchParams.get("page") || "1", 10), 1);
+  const pageSize = Math.min(Math.max(parseInt(url.searchParams.get("pageSize") || "10", 10), 1), 50);
+
+  // ۱) رویدادهای علاقه‌مندیِ اخیرِ کاربر (لایک + پخش)، هرکدوم حداکثر ۲۰۰ تای اخیر
+  let likeTagRows = [];
+  let playTagRows = [];
+  try {
+    const [likeRes, playRes] = await env.D1.batch([
+      env.D1.prepare(
+        `SELECT pt.tag AS tag FROM likes l JOIN post_tags pt ON pt.post_id = l.post_id
+         WHERE l.username = ? ORDER BY l.rowid DESC LIMIT 200`
+      ).bind(username),
+      env.D1.prepare(
+        `SELECT pt.tag AS tag, tp.completed AS completed FROM track_plays tp
+         JOIN post_tags pt ON pt.post_id = tp.post_id
+         WHERE tp.username = ? ORDER BY tp.played_at DESC LIMIT 200`
+      ).bind(username),
+    ]);
+    likeTagRows = likeRes.results || [];
+    playTagRows = playRes.results || [];
+  } catch (err) {
+    // اگه جدولِ post_tags/track_plays هنوز ساخته نشده باشه، بی‌صدا رد می‌شیم و می‌ریم سراغِ fallback محبوبیت
+    console.error("خطای گرفتنِ رویدادهای علاقه‌مندی (For You):", err.message);
+  }
+
+  const affinity = {};
+  for (const row of likeTagRows) affinity[row.tag] = (affinity[row.tag] || 0) + 3;
+  for (const row of playTagRows) affinity[row.tag] = (affinity[row.tag] || 0) + (row.completed ? 2 : 1);
+  const hasHistory = Object.keys(affinity).length > 0;
+
+  // ۲) استخرِ نامزدها: آهنگ‌های اخیر/پرطرفدار (سقفِ ۳۰۰ تا، برای اینکه امتیازدهی سبک بمونه)
+  let candidates = [];
+  try {
+    const poolRes = await env.D1.prepare(
+      `SELECT id, username, title, audio_title, audio_performer, audio_thumb, audio_feeling, file_id,
+              message_id, bot_slot, date, upvotes, downvotes, likes, tags, duration_seconds, type
+       FROM posts WHERE type = 'audio' ORDER BY date DESC LIMIT 300`
+    ).all();
+    candidates = poolRes.results || [];
+  } catch (err) {
+    console.error("خطای گرفتنِ استخرِ نامزدهای For You:", err);
+    return json({ error: "الگوریتمِ پیشنهاد فعلاً در دسترس نیست" }, 500);
+  }
+
+  if (candidates.length === 0) {
+    return json({ ok: true, posts: [], total: 0, page, pageSize, hasMore: false });
+  }
+
+  const candidateIds = candidates.map((c) => c.id);
+  const tagsByPost = {};
+  try {
+    const placeholders = candidateIds.map(() => "?").join(",");
+    const tagRes = await bind(env.D1.prepare(`SELECT post_id, tag FROM post_tags WHERE post_id IN (${placeholders})`), candidateIds).all();
+    for (const row of tagRes.results || []) {
+      if (!tagsByPost[row.post_id]) tagsByPost[row.post_id] = [];
+      tagsByPost[row.post_id].push(row.tag);
+    }
+  } catch (err) {
+    console.error("خطای گرفتنِ تگ‌های نامزدها:", err);
+  }
+
+  // اکسکلود کردنِ آهنگ‌هایی که کاربر همین اواخر (۲۴ ساعتِ اخیر) گوش داده، تا فید تکراری نشه
+  let recentlyPlayedSet = new Set();
+  try {
+    const recentRes = await env.D1.prepare(
+      "SELECT DISTINCT post_id FROM track_plays WHERE username = ? AND played_at > ?"
+    ).bind(username, Date.now() - 24 * 3600 * 1000).all();
+    recentlyPlayedSet = new Set((recentRes.results || []).map((r) => r.post_id));
+  } catch (err) {}
+
+  const scored = candidates
+    .filter((p) => !recentlyPlayedSet.has(p.id))
+    .map((p) => {
+      const postTags = tagsByPost[p.id] || [];
+      let tagScore = 0;
+      for (const t of postTags) tagScore += affinity[t] || 0;
+      const popularity = Math.log(1 + (p.likes || 0) + (p.upvotes || 0));
+      // اگه کاربر هنوز تاریخچه‌ای نداره، فقط محبوبیت تعیین‌کننده‌ست؛ وگرنه علاقه‌مندی وزنِ اصلی رو داره
+      const score = hasHistory ? tagScore * 10 + popularity : popularity;
+      return { post: p, score };
+    })
+    .sort((a, b) => b.score - a.score || b.post.date - a.post.date);
+
+  const total = scored.length;
+  const start = (page - 1) * pageSize;
+  const pagePosts = scored.slice(start, start + pageSize).map((s) => ({
+    ...s.post,
+    upvotes: s.post.upvotes || 0,
+    downvotes: s.post.downvotes || 0,
+    likes: s.post.likes || 0,
+    userVote: null,
+    liked: false,
+    comment_count: 0,
+    pinned: false,
+  }));
+
+  // آواتار/لایک/رایِ خودِ کاربر برای همین صفحه (مثلِ fetchFeedPage) تا کارتِ رندرشده کامل باشه
+  if (pagePosts.length > 0) {
+    const uniqueUsernames = [...new Set(pagePosts.map((p) => p.username))];
+    const postIds = pagePosts.map((p) => p.id);
+    try {
+      const [avatarRes, voteRes, likeRes] = await env.D1.batch([
+        bind(env.D1.prepare(`SELECT username, avatar_file_id FROM profiles WHERE username IN (${uniqueUsernames.map(() => "?").join(",")})`), uniqueUsernames),
+        bind(env.D1.prepare(`SELECT post_id, action FROM votes WHERE username = ? AND post_id IN (${postIds.map(() => "?").join(",")})`), [username, ...postIds]),
+        bind(env.D1.prepare(`SELECT post_id FROM likes WHERE username = ? AND post_id IN (${postIds.map(() => "?").join(",")})`), [username, ...postIds]),
+      ]);
+      const avatarMap = {};
+      for (const row of avatarRes.results || []) if (row.avatar_file_id) avatarMap[row.username] = row.avatar_file_id;
+      const voteMap = {};
+      for (const row of voteRes.results || []) voteMap[row.post_id] = row.action;
+      const likeMap = {};
+      for (const row of likeRes.results || []) likeMap[row.post_id] = true;
+      for (const p of pagePosts) {
+        p.avatar_file_id = avatarMap[p.username] || null;
+        p.userVote = voteMap[p.id] || null;
+        p.liked = !!likeMap[p.id];
+      }
+    } catch (err) {
+      console.error("خطای غنی‌سازیِ صفحه‌ی For You:", err);
+    }
+  }
+
+  return json({
+    ok: true,
+    posts: pagePosts,
+    total,
+    page,
+    pageSize,
+    hasMore: start + pageSize < total,
+    personalized: hasHistory,
+  });
+}
+
+// #endregion
+// #region صفحه‌ی اصلیِ سگ‌تونز — ردیف‌های افقیِ دسته‌بندی‌شده (دیلی‌میکس / خواننده‌های موردعلاقه / کشفِ ژانرهای جدید)
+// این بخش رویِ همون منطقِ «برای شما»ی بالا سوار می‌شه، فقط به‌جای یه فیدِ تخت، ۳ ردیفِ جدا برمی‌گردونه.
+// هر سه ردیف از یه استخرِ نامزدِ مشترک (fetchAudioCandidatePool) تغذیه می‌شن تا نیازی به کوئری‌های تکراری نباشه.
+
+const MUSIC_HOME_SECTIONS = {
+  daily_mix: "سالاد شیرازی روزانه شما",
+  favorite_artists: "خواننده‌های مورد علاقه",
+  discover: "چیزای جدید بد نیستن",
+};
+
+// استخرِ نامزدها: آهنگ‌های اخیر/پرطرفدار. limit رو صفحه‌ی «دیدن بیشتر» بزرگ‌تر می‌فرسته چون اونجا
+// دیگه باید بشه صفحه‌بندی کرد، نه فقط ۱۲ تای اول.
+async function fetchAudioCandidatePool(env, limit) {
+  const poolRes = await env.D1.prepare(
+    `SELECT id, username, title, audio_title, audio_performer, audio_thumb, audio_feeling, file_id,
+            message_id, bot_slot, date, upvotes, downvotes, likes, tags, duration_seconds, type
+     FROM posts WHERE type = 'audio' ORDER BY date DESC LIMIT ?`
+  ).bind(limit).all();
+  return poolRes.results || [];
+}
+
+// امتیازِ علاقه‌مندیِ کاربر: هم بر اساسِ تگ (برای دیلی‌میکس/کشف) هم بر اساسِ خواننده (برای «موردعلاقه‌ها»)
+async function getUserAffinityData(env, username) {
+  const result = {
+    tagAffinity: {},
+    performerAffinity: {},
+    hasTagHistory: false,
+    hasPerformerHistory: false,
+    recentlyPlayedSet: new Set(),
+  };
+  try {
+    const [likeTagRes, playTagRes, likePerfRes, playPerfRes, recentRes] = await env.D1.batch([
+      env.D1.prepare(
+        `SELECT pt.tag AS tag FROM likes l JOIN post_tags pt ON pt.post_id = l.post_id
+         WHERE l.username = ? ORDER BY l.rowid DESC LIMIT 200`
+      ).bind(username),
+      env.D1.prepare(
+        `SELECT pt.tag AS tag, tp.completed AS completed FROM track_plays tp
+         JOIN post_tags pt ON pt.post_id = tp.post_id
+         WHERE tp.username = ? ORDER BY tp.played_at DESC LIMIT 200`
+      ).bind(username),
+      env.D1.prepare(
+        `SELECT posts.audio_performer AS performer FROM likes l JOIN posts ON posts.id = l.post_id
+         WHERE l.username = ? AND posts.type = 'audio' AND posts.audio_performer IS NOT NULL
+         ORDER BY l.rowid DESC LIMIT 200`
+      ).bind(username),
+      env.D1.prepare(
+        `SELECT posts.audio_performer AS performer, tp.completed AS completed FROM track_plays tp
+         JOIN posts ON posts.id = tp.post_id
+         WHERE tp.username = ? AND posts.type = 'audio' AND posts.audio_performer IS NOT NULL
+         ORDER BY tp.played_at DESC LIMIT 200`
+      ).bind(username),
+      env.D1.prepare(
+        "SELECT DISTINCT post_id FROM track_plays WHERE username = ? AND played_at > ?"
+      ).bind(username, Date.now() - 24 * 3600 * 1000),
+    ]);
+    for (const row of likeTagRes.results || []) result.tagAffinity[row.tag] = (result.tagAffinity[row.tag] || 0) + 3;
+    for (const row of playTagRes.results || []) result.tagAffinity[row.tag] = (result.tagAffinity[row.tag] || 0) + (row.completed ? 2 : 1);
+    for (const row of likePerfRes.results || []) result.performerAffinity[row.performer] = (result.performerAffinity[row.performer] || 0) + 3;
+    for (const row of playPerfRes.results || []) result.performerAffinity[row.performer] = (result.performerAffinity[row.performer] || 0) + (row.completed ? 2 : 1);
+    result.recentlyPlayedSet = new Set((recentRes.results || []).map((r) => r.post_id));
+    result.hasTagHistory = Object.keys(result.tagAffinity).length > 0;
+    result.hasPerformerHistory = Object.keys(result.performerAffinity).length > 0;
+  } catch (err) {
+    // جدول‌های post_tags/track_plays شاید هنوز خالی/نساخته باشن؛ بی‌صدا رد می‌شیم، فال‌بکِ محبوبیت جای خالیش رو پر می‌کنه
+    console.error("خطای گرفتنِ دیتای علاقه‌مندیِ کاربر (Music Home):", err.message);
+  }
+  return result;
+}
+
+async function fetchTagsByPost(env, postIds) {
+  const tagsByPost = {};
+  if (postIds.length === 0) return tagsByPost;
+  try {
+    const placeholders = postIds.map(() => "?").join(",");
+    const tagRes = await bind(env.D1.prepare(`SELECT post_id, tag FROM post_tags WHERE post_id IN (${placeholders})`), postIds).all();
+    for (const row of tagRes.results || []) {
+      if (!tagsByPost[row.post_id]) tagsByPost[row.post_id] = [];
+      tagsByPost[row.post_id].push(row.tag);
+    }
+  } catch (err) {
+    console.error("خطای گرفتنِ تگ‌های نامزدها (Music Home):", err);
+  }
+  return tagsByPost;
+}
+
+function popularityOf(p) {
+  return Math.log(1 + (p.likes || 0) + (p.upvotes || 0));
+}
+
+// ردیفِ ۱: دیلی‌میکس — دقیقاً همون منطقِ امتیازدهیِ «برای شما»یِ بالا (تگ‌محور)
+function scoreDailyMix(candidates, tagsByPost, affinityData) {
+  const { tagAffinity, hasTagHistory } = affinityData;
+  return candidates
+    .map((p) => {
+      const postTags = tagsByPost[p.id] || [];
+      let tagScore = 0;
+      for (const t of postTags) tagScore += tagAffinity[t] || 0;
+      const score = hasTagHistory ? tagScore * 10 + popularityOf(p) : popularityOf(p);
+      return { post: p, score };
+    })
+    .sort((a, b) => b.score - a.score || b.post.date - a.post.date);
+}
+
+// ردیفِ ۲: خواننده‌های موردعلاقه — بر اساسِ audio_performer (نه تگ)، چون خواننده مستقیم رویِ خودِ پست ذخیره‌ست
+function scoreFavoriteArtists(candidates, affinityData) {
+  const { performerAffinity, hasPerformerHistory } = affinityData;
+  const withPerformer = candidates.filter((p) => p.audio_performer);
+  if (!hasPerformerHistory) {
+    // کاربرِ تازه‌وارد بدونِ تاریخچه: پرطرفدارترین آهنگ‌های خواننده‌دار رو نشون بده تا خواننده‌ها معرفی بشن
+    return withPerformer
+      .map((p) => ({ post: p, score: popularityOf(p) }))
+      .sort((a, b) => b.score - a.score || b.post.date - a.post.date);
+  }
+  return withPerformer
+    .filter((p) => performerAffinity[p.audio_performer])
+    .map((p) => ({ post: p, score: (performerAffinity[p.audio_performer] || 0) * 10 + popularityOf(p) }))
+    .sort((a, b) => b.score - a.score || b.post.date - a.post.date);
+}
+
+// ردیفِ ۳: کشفِ ژانرهای جدید — آهنگ‌هایی که هیچ‌کدوم از تگ‌هاشون تویِ تگ‌های موردعلاقه‌ی کاربر نیست (یعنی واقعاً تازه/غریبه‌ست براش)
+// نکته: چون تگ‌ها (خواننده/ژانر/آلبوم/حس/سال) همه تویِ یه جدولِ تخت ذخیره می‌شن و نوعشون جدا مشخص نیست،
+// این «تازگی» یه تخمینه، نه فیلترِ دقیقِ ژانر؛ برای دقیقِ‌تر شدنش بعداً می‌شه یه ستونِ tag_type اضافه کرد.
+function scoreDiscoverGenres(candidates, tagsByPost, affinityData) {
+  const { tagAffinity, hasTagHistory } = affinityData;
+  const knownTags = new Set(Object.keys(tagAffinity));
+  let pool = candidates;
+  if (hasTagHistory) {
+    pool = candidates.filter((p) => {
+      const postTags = tagsByPost[p.id] || [];
+      return postTags.length === 0 || !postTags.some((t) => knownTags.has(t));
+    });
+  }
+  return pool
+    .map((p) => ({ post: p, score: p.date + popularityOf(p) * 1000 })) // عمدتاً تازگیِ آپلود، محبوبیت فقط تای‌بریک
+    .sort((a, b) => b.score - a.score);
+}
+
+const SECTION_SCORERS = {
+  daily_mix: scoreDailyMix,
+  favorite_artists: (candidates, tagsByPost, affinityData) => scoreFavoriteArtists(candidates, affinityData),
+  discover: scoreDiscoverGenres,
+};
+
+// چندتا پستِ نهایی (از هرسه ردیف روی‌هم) رو یک‌جا با آواتار/رای/لایکِ بازدیدکننده غنی می‌کنیم — دقیقاً مثلِ fetchFeedPage/For You
+async function enrichPostsForViewer(env, username, posts) {
+  if (posts.length === 0) return posts;
+  const uniqueUsernames = [...new Set(posts.map((p) => p.username))];
+  const postIds = posts.map((p) => p.id);
+  try {
+    const [avatarRes, voteRes, likeRes] = await env.D1.batch([
+      bind(env.D1.prepare(`SELECT username, avatar_file_id FROM profiles WHERE username IN (${uniqueUsernames.map(() => "?").join(",")})`), uniqueUsernames),
+      bind(env.D1.prepare(`SELECT post_id, action FROM votes WHERE username = ? AND post_id IN (${postIds.map(() => "?").join(",")})`), [username, ...postIds]),
+      bind(env.D1.prepare(`SELECT post_id FROM likes WHERE username = ? AND post_id IN (${postIds.map(() => "?").join(",")})`), [username, ...postIds]),
+    ]);
+    const avatarMap = {};
+    for (const row of avatarRes.results || []) if (row.avatar_file_id) avatarMap[row.username] = row.avatar_file_id;
+    const voteMap = {};
+    for (const row of voteRes.results || []) voteMap[row.post_id] = row.action;
+    const likeMap = {};
+    for (const row of likeRes.results || []) likeMap[row.post_id] = true;
+    for (const p of posts) {
+      p.avatar_file_id = avatarMap[p.username] || null;
+      p.userVote = voteMap[p.id] || null;
+      p.liked = !!likeMap[p.id];
+    }
+  } catch (err) {
+    console.error("خطای غنی‌سازیِ پست‌های صفحه‌ی اصلیِ سگ‌تونز:", err);
+  }
+  return posts;
+}
+
+function normalizeTrack(p) {
+  return {
+    ...p,
+    upvotes: p.upvotes || 0,
+    downvotes: p.downvotes || 0,
+    likes: p.likes || 0,
+    userVote: null,
+    liked: false,
+    comment_count: 0,
+    pinned: false,
+  };
+}
+
+// GET /api/music/home — ۳ ردیفِ اول (حداکثر ۱۲ تا هرکدوم) برای صفحه‌ی اصلیِ سگ‌تونز
+async function handleMusicHome(request, env) {
+  const username = await getUserFromToken(request, env);
+  if (!username) return json({ error: "ابتدا وارد شو" }, 401);
+
+  const ROW_SIZE = 12;
+  let candidates = [];
+  try {
+    candidates = await fetchAudioCandidatePool(env, 300);
+  } catch (err) {
+    console.error("خطای گرفتنِ استخرِ نامزدهای صفحه‌ی اصلیِ سگ‌تونز:", err);
+    return json({ error: "فعلاً در دسترس نیست" }, 500);
+  }
+
+  if (candidates.length === 0) {
+    return json({
+      ok: true,
+      sections: Object.keys(MUSIC_HOME_SECTIONS).map((id) => ({ id, title: MUSIC_HOME_SECTIONS[id], tracks: [], hasMore: false })),
+    });
+  }
+
+  const candidateIds = candidates.map((c) => c.id);
+  const [tagsByPost, affinityData] = await Promise.all([
+    fetchTagsByPost(env, candidateIds),
+    getUserAffinityData(env, username),
+  ]);
+
+  // آهنگ‌هایی که کاربر همین ۲۴ ساعتِ اخیر گوش داده، از هرسه ردیف حذف می‌شن تا فید تکراری نشه
+  const pool = candidates.filter((p) => !affinityData.recentlyPlayedSet.has(p.id));
+
+  const usedIds = new Set(); // بینِ ردیف‌ها هم تکراری نشه — هر آهنگ فقط تویِ اولین ردیفی که واجدِ شرایطشه می‌افته
+  const sectionResults = {};
+  for (const sectionId of Object.keys(MUSIC_HOME_SECTIONS)) {
+    const scored = SECTION_SCORERS[sectionId](pool, tagsByPost, affinityData);
+    const picked = [];
+    for (const s of scored) {
+      if (usedIds.has(s.post.id)) continue;
+      picked.push(s.post);
+      usedIds.add(s.post.id);
+      if (picked.length >= ROW_SIZE) break;
+    }
+    sectionResults[sectionId] = picked;
+  }
+
+  const allPicked = Object.values(sectionResults).flat().map(normalizeTrack);
+  await enrichPostsForViewer(env, username, allPicked);
+  const enrichedById = {};
+  for (const p of allPicked) enrichedById[p.id] = p;
+
+  const sections = Object.keys(MUSIC_HOME_SECTIONS).map((id) => ({
+    id,
+    title: MUSIC_HOME_SECTIONS[id],
+    tracks: sectionResults[id].map((p) => enrichedById[p.id]),
+    hasMore: sectionResults[id].length >= ROW_SIZE, // تخمینیه؛ صفحه‌ی «دیدن بیشتر» خودش با total دقیق می‌شه
+  }));
+
+  return json({ ok: true, sections, personalized: affinityData.hasTagHistory || affinityData.hasPerformerHistory });
+}
+
+// GET /api/music/section?section=daily_mix|favorite_artists|discover&page=1&pageSize=12 — «دیدن بیشتر»یِ هر ردیف
+async function handleMusicSection(request, env) {
+  const username = await getUserFromToken(request, env);
+  if (!username) return json({ error: "ابتدا وارد شو" }, 401);
+
+  const url = new URL(request.url);
+  const sectionId = (url.searchParams.get("section") || "").trim();
+  if (!MUSIC_HOME_SECTIONS[sectionId]) return json({ error: "بخشِ نامعتبر" }, 400);
+
+  const page = Math.max(parseInt(url.searchParams.get("page") || "1", 10), 1);
+  const pageSize = Math.min(Math.max(parseInt(url.searchParams.get("pageSize") || "12", 10), 1), 50);
+
+  let candidates = [];
+  try {
+    // برای «دیدن بیشتر» استخرِ بزرگ‌تری لازمه چون داریم صفحه‌بندی می‌کنیم، نه فقط ۱۲ تای اول
+    candidates = await fetchAudioCandidatePool(env, 1000);
+  } catch (err) {
+    console.error("خطای گرفتنِ استخرِ نامزدهایِ «دیدن بیشتر»:", err);
+    return json({ error: "فعلاً در دسترس نیست" }, 500);
+  }
+
+  if (candidates.length === 0) {
+    return json({ ok: true, id: sectionId, title: MUSIC_HOME_SECTIONS[sectionId], tracks: [], total: 0, page, pageSize, hasMore: false });
+  }
+
+  const candidateIds = candidates.map((c) => c.id);
+  const [tagsByPost, affinityData] = await Promise.all([
+    fetchTagsByPost(env, candidateIds),
+    getUserAffinityData(env, username),
+  ]);
+
+  const pool = candidates.filter((p) => !affinityData.recentlyPlayedSet.has(p.id));
+  const scored = SECTION_SCORERS[sectionId](pool, tagsByPost, affinityData);
+
+  const total = scored.length;
+  const start = (page - 1) * pageSize;
+  const pageTracks = scored.slice(start, start + pageSize).map((s) => normalizeTrack(s.post));
+  await enrichPostsForViewer(env, username, pageTracks);
+
+  return json({
+    ok: true,
+    id: sectionId,
+    title: MUSIC_HOME_SECTIONS[sectionId],
+    tracks: pageTracks,
+    total,
+    page,
+    pageSize,
+    hasMore: start + pageSize < total,
+  });
+}
+// #endregion
 async function handlePost(request, env) {
   const username = await getUserFromToken(request, env);
   if (!username) return json({ error: "ابتدا وارد شو" }, 401);
@@ -1335,6 +2008,13 @@ async function handlePost(request, env) {
       .slice(0, 6);
   }
   const tagsJson = tags.length ? JSON.stringify(tags) : null;
+
+  // موزیک: هر آهنگ باید حداقل ۲ تگِ جداگانه داشته باشه (برای الگوریتمِ «برای شما»ی سگ‌تونز).
+  // اینجا زودتر از تماس با تلگرام چک می‌شه تا اگه تگ کافی نبود، آپلودِ واقعیِ فایل اصلاً شروع نشه.
+  const isAudioUpload = (hasFile && file.type.startsWith("audio/")) || (hasPreUploaded && preUploadedFileType === "audio");
+  if (isAudioUpload && tags.length < 2) {
+    return json({ error: "برای آهنگ باید حداقل ۲ تگِ جداگانه انتخاب کنی" }, 400);
+  }
 
   if (!text && !hasFile && !hasPreUploaded) return json({ error: "پست نمی‌تونه خالی باشه" }, 400);
   if (text.length > 2000) return json({ error: "متن خیلی طولانیه" }, 400);
@@ -1515,6 +2195,18 @@ async function handlePost(request, env) {
     // Cloudflare (تبِ Logs) قابلِ دیدنه
     console.error("خطای ذخیره‌ی پست در D1:", err, JSON.stringify(post));
     return json({ error: "ذخیره‌ی پست روی سرور ناموفق بود، دوباره امتحان کن" }, 500);
+  }
+
+  // نسخه‌ی نرمال‌شده‌ی تگ‌ها هم توی post_tags ذخیره می‌شه (برای جستجو/رتبه‌بندیِ For You)؛
+  // best-effort — اگه شکست بخوره جلویِ ثبتِ خودِ پست رو نمی‌گیره
+  if (tags.length > 0) {
+    try {
+      await env.D1.batch(
+        tags.map((t) => env.D1.prepare("INSERT OR IGNORE INTO post_tags (post_id, tag) VALUES (?, ?)").bind(id, t))
+      );
+    } catch (err) {
+      console.error("خطای ذخیره‌ی post_tags:", err);
+    }
   }
 
   return json({ ok: true, post });
@@ -3207,6 +3899,8 @@ async function handleDeletePost(request, env) {
     env.D1.prepare("DELETE FROM comments WHERE post_id = ?").bind(id),
     env.D1.prepare("DELETE FROM votes WHERE post_id = ?").bind(id),
     env.D1.prepare("DELETE FROM likes WHERE post_id = ?").bind(id),
+    env.D1.prepare("DELETE FROM post_tags WHERE post_id = ?").bind(id),
+    env.D1.prepare("DELETE FROM track_plays WHERE post_id = ?").bind(id),
   ]);
 
   return json({ ok: true });
@@ -3251,9 +3945,22 @@ async function handleEditPost(request, env) {
   }
   const tagsJson = tags.length ? JSON.stringify(tags) : null;
 
+  if (post.type === "audio" && tags.length < 2) {
+    return json({ error: "برای آهنگ باید حداقل ۲ تگِ جداگانه انتخاب کنی" }, 400);
+  }
+
   await env.D1.prepare("UPDATE posts SET text = ?, title = ?, tags = ?, edited = 1 WHERE id = ?")
     .bind(text || null, title || null, tagsJson, id)
     .run();
+
+  // post_tags رو با تگ‌های جدید همگام می‌کنیم: قبلی‌ها حذف، جدیدها اضافه (best-effort)
+  try {
+    const syncStmts = [env.D1.prepare("DELETE FROM post_tags WHERE post_id = ?").bind(id)];
+    for (const t of tags) syncStmts.push(env.D1.prepare("INSERT OR IGNORE INTO post_tags (post_id, tag) VALUES (?, ?)").bind(id, t));
+    await env.D1.batch(syncStmts);
+  } catch (err) {
+    console.error("خطای همگام‌سازیِ post_tags در ویرایش:", err);
+  }
 
   // به‌روزرسانیِ کپشنِ پیامِ تلگرام هم (best-effort؛ اگه شکست بخوره جلویِ ثبتِ ویرایش رو نمی‌گیره)
   try {
@@ -7145,6 +7852,24 @@ async function routeRequest(url, request, env, ctx) {
       }
       if (url.pathname === "/api/feed" && request.method === "GET") {
         return await handleFeed(request, env);
+      }
+      if (url.pathname === "/api/music/lookup" && request.method === "GET") {
+        return await handleMusicLookup(request, env);
+      }
+      if (url.pathname === "/api/admin/music/backfill-tags" && request.method === "POST") {
+        return await handleBackfillMusicTags(request, env);
+      }
+      if (url.pathname === "/api/music/play" && request.method === "POST") {
+        return await handleTrackPlay(request, env);
+      }
+      if (url.pathname === "/api/foryou" && request.method === "GET") {
+        return await handleForYou(request, env);
+      }
+      if (url.pathname === "/api/music/home" && request.method === "GET") {
+        return await handleMusicHome(request, env);
+      }
+      if (url.pathname === "/api/music/section" && request.method === "GET") {
+        return await handleMusicSection(request, env);
       }
       if (url.pathname === "/api/deels/mark-seen" && request.method === "POST") {
         return await handleMarkDeelsSeen(request, env);
