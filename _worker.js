@@ -1281,12 +1281,13 @@ async function checkPostCooldown(env, username) {
 
 
 // #region جستجوی تایتلِ واقعیِ آهنگ + پیشنهادِ خودکارِ تگ (خواننده/آلبوم/ژانر/حس)
-// ---------- جستجوی تایتلِ واقعیِ آهنگ (iTunes Search API — رایگان، بدون کلید، مخصوصِ موسیقی) ----------
-// دلیلِ استفاده از iTunes به‌جای سرچِ عمومیِ گوگل: بدون API Key کار می‌کنه، خروجیش ساختاریافته‌ست
-// (اسمِ دقیقِ خواننده/آلبوم/ژانر رو جدا می‌ده، نه یه لینک/اسنیپتِ خام) و برای «پیدا کردنِ تایتلِ
-// واقعیِ یه آهنگ» به‌طورِ خاص دقیق‌تر از یه سرچِ عمومیه.
+// چهار منبع، به‌ترتیبِ اولویت: iTunes → Deezer (هر دو رایگان و بدونِ کلید) → Spotify → YouTube Music
+// (این دو تا فقط اگه Ali کلیدشون رو به‌عنوانِ Cloudflare Secret ست کرده باشه فعال می‌شن، وگرنه بی‌صدا
+// رد می‌شن). به‌محضِ اولین منبعی که یه نتیجه‌ی معنی‌دار (حداقل خواننده یا ژانر) برگردونه، بقیه رو
+// امتحان نمی‌کنیم — این باعث می‌شه اکثرِ آهنگ‌های شناخته‌شده همون سرِ iTunes (سریع‌ترین) حل بشن، و فقط
+// آهنگ‌های نایاب/زیرزمینی/فارسی که تویِ iTunes نیستن به منابعِ بعدی می‌رسن.
 
-// دیکشنریِ کلمه‌کلیدی → تگِ «حس» (چون iTunes خودش mood رو برنمی‌گردونه؛ از رویِ تایتل/ژانر حدس می‌زنیم)
+// دیکشنریِ کلمه‌کلیدی → تگِ «حس» (هیچ‌کدوم از این منابع مستقیم mood نمی‌دن؛ از رویِ تایتل/ژانر حدس می‌زنیم)
 const MOOD_KEYWORD_MAP = [
   { tag: "غمگین", words: ["غمگین", "غم", "دلتنگ", "بغض", "گریه", "جدایی", "تنها", "sad", "cry", "heartbreak", "lonely"] },
   { tag: "شاد", words: ["شاد", "رقص", "جشن", "پارتی", "happy", "party", "dance", "celebration"] },
@@ -1309,6 +1310,197 @@ function cleanTagValue(v) {
   return (v || "").toString().replace(/["'`]/g, "").trim().slice(0, 30);
 }
 
+// ---------- منبعِ ۱: iTunes Search API — رایگان، بدون کلید، خروجیِ ساختاریافته و سریع ----------
+async function searchITunesMeta(q) {
+  const apiUrl = `https://itunes.apple.com/search?term=${encodeURIComponent(q)}&media=music&entity=song&limit=1`;
+  const res = await fetch(apiUrl, { headers: { "User-Agent": "dehaat-worker" } });
+  if (!res.ok) return null;
+  const data = await res.json();
+  const results = Array.isArray(data.results) ? data.results : [];
+  if (results.length === 0) return null;
+  const best = results[0];
+  return {
+    title: cleanTagValue(best.trackName),
+    artist: cleanTagValue(best.artistName),
+    album: cleanTagValue(best.collectionName),
+    genre: cleanTagValue(best.primaryGenreName),
+    releaseYear: best.releaseDate ? String(best.releaseDate).slice(0, 4) : null,
+    artworkUrl: best.artworkUrl100 ? best.artworkUrl100.replace("100x100", "400x400") : null,
+    source: "itunes",
+  };
+}
+
+// ---------- منبعِ ۲: Deezer — رایگان، بدون کلید، کاتالوگش برایِ خیلی از آهنگ‌های غیرِغربی از iTunes
+// کامل‌تره. ژانر رو مستقیم تو سرچ نمی‌ده، برای همین (فقط وقتی به این‌جا رسیدیم) یه فچِ اضافه‌ی سبک
+// روی خودِ آلبوم می‌زنیم که ژانرش رو دربیاریم ----------
+async function searchDeezerMeta(q) {
+  const apiUrl = `https://api.deezer.com/search?q=${encodeURIComponent(q)}&limit=1`;
+  const res = await fetch(apiUrl, { headers: { "User-Agent": "dehaat-worker" } });
+  if (!res.ok) return null;
+  const data = await res.json();
+  const results = Array.isArray(data.data) ? data.data : [];
+  if (results.length === 0) return null;
+  const best = results[0];
+
+  let genre = null;
+  try {
+    if (best.album && best.album.id) {
+      const albumRes = await fetch(`https://api.deezer.com/album/${best.album.id}`, { headers: { "User-Agent": "dehaat-worker" } });
+      if (albumRes.ok) {
+        const albumData = await albumRes.json();
+        const genres = albumData.genres && albumData.genres.data;
+        if (genres && genres.length) genre = cleanTagValue(genres[0].name);
+      }
+    }
+  } catch (e) { /* ژانر پیدا نشد، بی‌خیالش می‌شیم، بقیه‌ی فیلدها همچنان معتبرن */ }
+
+  return {
+    title: cleanTagValue(best.title),
+    artist: cleanTagValue(best.artist && best.artist.name),
+    album: cleanTagValue(best.album && best.album.title),
+    genre,
+    releaseYear: null, // سرچِ دیزر تاریخِ انتشار نمی‌ده
+    artworkUrl: (best.album && best.album.cover_medium) || null,
+    source: "deezer",
+  };
+}
+
+// ---------- منبعِ ۳: Spotify — فقط اگه SPOTIFY_CLIENT_ID/SPOTIFY_CLIENT_SECRET به‌عنوانِ Cloudflare
+// Secret ست شده باشن (Client Credentials Flow، بدونِ نیاز به لاگینِ کاربر). توکن ۵۵ دقیقه تو KV کش
+// می‌شه که هر سرچ یه درخواستِ اضافه‌ی auth نزنه ----------
+async function getSpotifyToken(env) {
+  if (!env.SPOTIFY_CLIENT_ID || !env.SPOTIFY_CLIENT_SECRET) return null;
+  const cacheKey = "spotify_token";
+  try {
+    const cached = await kvGet(env, cacheKey);
+    if (cached) return cached;
+  } catch (e) { /* کش نبود، بی‌خیال، از نو می‌گیریم */ }
+
+  try {
+    const authRes = await fetch("https://accounts.spotify.com/api/token", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/x-www-form-urlencoded",
+        "Authorization": "Basic " + btoa(`${env.SPOTIFY_CLIENT_ID}:${env.SPOTIFY_CLIENT_SECRET}`),
+      },
+      body: "grant_type=client_credentials",
+    });
+    if (!authRes.ok) return null;
+    const authData = await authRes.json();
+    const token = authData.access_token;
+    if (token) await kvPut(env, cacheKey, token, Math.max(60, (authData.expires_in || 3600) - 60));
+    return token || null;
+  } catch (e) {
+    return null;
+  }
+}
+
+async function searchSpotifyMeta(q, env) {
+  const token = await getSpotifyToken(env);
+  if (!token) return null;
+  const res = await fetch(`https://api.spotify.com/v1/search?q=${encodeURIComponent(q)}&type=track&limit=1`, {
+    headers: { Authorization: `Bearer ${token}` },
+  });
+  if (!res.ok) return null;
+  const data = await res.json();
+  const items = data.tracks && data.tracks.items;
+  if (!items || items.length === 0) return null;
+  const best = items[0];
+
+  // اسپاتیفای ژانر رو رویِ خودِ ترک نمی‌ده؛ باید از خواننده جدا بگیریمش
+  let genre = null;
+  try {
+    const artistId = best.artists && best.artists[0] && best.artists[0].id;
+    if (artistId) {
+      const artistRes = await fetch(`https://api.spotify.com/v1/artists/${artistId}`, { headers: { Authorization: `Bearer ${token}` } });
+      if (artistRes.ok) {
+        const artistData = await artistRes.json();
+        if (artistData.genres && artistData.genres.length) genre = cleanTagValue(artistData.genres[0]);
+      }
+    }
+  } catch (e) { /* ژانر پیدا نشد، بی‌خیالش می‌شیم */ }
+
+  return {
+    title: cleanTagValue(best.name),
+    artist: cleanTagValue(best.artists && best.artists.map((a) => a.name).join(", ")),
+    album: cleanTagValue(best.album && best.album.name),
+    genre,
+    releaseYear: best.album && best.album.release_date ? String(best.album.release_date).slice(0, 4) : null,
+    artworkUrl: best.album && best.album.images && best.album.images[0] ? best.album.images[0].url : null,
+    source: "spotify",
+  };
+}
+
+// ---------- منبعِ ۴ (آخرین چاره): YouTube — فقط اگه YOUTUBE_API_KEY ست شده باشه. یوتیوب‌موزیکِ رسمی
+// API عمومی نداره، برایِ همین از YouTube Data API v3 (سرچِ ویدیوهایِ دسته‌یِ موسیقی) استفاده می‌کنیم.
+// برخلافِ سه منبعِ بالا، این یکی متادیتایِ ساختاریافته نداره — نه ژانر، نه خواننده‌ی جدا؛ فقط عنوانِ
+// ویدیو رو داریم که معمولاً به شکلِ «خواننده - اسمِ آهنگ»ه، با حدس جداش می‌کنیم. برایِ همین آخرین
+// اولویته: فقط وقتی سه منبعِ قبلی هیچی پیدا نکردن به سراغش می‌ریم ----------
+async function searchYouTubeMeta(q, env) {
+  if (!env.YOUTUBE_API_KEY) return null;
+  const apiUrl = `https://www.googleapis.com/youtube/v3/search?part=snippet&type=video&videoCategoryId=10&maxResults=1&q=${encodeURIComponent(q)}&key=${env.YOUTUBE_API_KEY}`;
+  const res = await fetch(apiUrl);
+  if (!res.ok) return null;
+  const data = await res.json();
+  const items = data.items;
+  if (!items || items.length === 0) return null;
+  const snippet = items[0].snippet;
+  const rawTitle = snippet.title || "";
+  const dashSplit = rawTitle.split(/\s[-–]\s/);
+  const artist = dashSplit.length >= 2 ? cleanTagValue(dashSplit[0]) : cleanTagValue(snippet.channelTitle);
+  const title = dashSplit.length >= 2 ? cleanTagValue(dashSplit.slice(1).join(" - ")) : cleanTagValue(rawTitle);
+
+  return {
+    title,
+    artist,
+    album: null,
+    genre: null, // یوتیوب ژانرِ ساختاریافته نداره
+    releaseYear: snippet.publishedAt ? String(snippet.publishedAt).slice(0, 4) : null,
+    artworkUrl: snippet.thumbnails && snippet.thumbnails.high ? snippet.thumbnails.high.url : null,
+    source: "youtube",
+  };
+}
+
+// زنجیره‌ی جستجو: هر منبع رو به‌ترتیب امتحان می‌کنه، به‌محضِ اولین نتیجه‌ی معنی‌دار (خواننده یا ژانر
+// داشته باشه) متوقف می‌شه. خطایِ هر منبع بی‌صدا رد می‌شه و می‌ره سراغِ منبعِ بعدی
+async function searchMusicMetadataChain(q, env) {
+  const sources = [
+    () => searchITunesMeta(q),
+    () => searchDeezerMeta(q),
+    () => searchSpotifyMeta(q, env),
+    () => searchYouTubeMeta(q, env),
+  ];
+  for (const fn of sources) {
+    try {
+      const result = await fn();
+      if (result && (result.artist || result.genre)) return result;
+    } catch (e) {
+      console.error("خطای یکی از منابعِ جستجویِ موسیقی:", e.message);
+    }
+  }
+  return null;
+}
+
+// از رویِ نتیجه‌ی هر کدوم از منابعِ بالا، لیستِ نهاییِ تگ‌های پیشنهادی رو می‌سازه: خواننده + ژانر + آلبوم +
+// حس (هرکدوم که موجود بود)، بدونِ تکراری، حداکثر ۶ تا — این تابع مشترکه بینِ هم پیشنهادِ آپلودِ جدید
+// (handleMusicLookup) هم برچسب‌گذاریِ گروهیِ آهنگ‌های قدیمی (handleBackfillMusicTags)
+function buildSuggestedTagsFromMeta(meta) {
+  if (!meta) return [];
+  const moodTags = detectMoodTags(`${meta.title || ""} ${meta.genre || ""}`);
+  const tags = [];
+  const pushTag = (t) => {
+    if (!t) return;
+    const norm = t.trim();
+    if (norm && !tags.some((x) => x.toLowerCase() === norm.toLowerCase())) tags.push(norm);
+  };
+  pushTag(meta.artist);
+  pushTag(meta.genre);
+  if (meta.album && meta.title && meta.album.toLowerCase() !== meta.title.toLowerCase()) pushTag(meta.album);
+  moodTags.forEach(pushTag);
+  if (meta.releaseYear) pushTag(meta.releaseYear);
+  return tags.slice(0, 6);
+}
+
 async function handleMusicLookup(request, env) {
   const username = await getUserFromToken(request, env);
   if (!username) return json({ error: "ابتدا وارد شو" }, 401);
@@ -1322,47 +1514,23 @@ async function handleMusicLookup(request, env) {
   if (!q) return json({ ok: true, matched: false, suggestions: [] });
 
   try {
-    const apiUrl = `https://itunes.apple.com/search?term=${encodeURIComponent(q)}&media=music&entity=song&limit=5`;
-    const res = await fetch(apiUrl, { headers: { "User-Agent": "dehaat-worker" } });
-    if (!res.ok) return json({ ok: true, matched: false, suggestions: [] });
-    const data = await res.json();
-    const results = Array.isArray(data.results) ? data.results : [];
-    if (results.length === 0) return json({ ok: true, matched: false, suggestions: [] });
-
-    const best = results[0];
-    const realTitle = cleanTagValue(best.trackName);
-    const artist = cleanTagValue(best.artistName);
-    const album = cleanTagValue(best.collectionName);
-    const genre = cleanTagValue(best.primaryGenreName);
-    const releaseYear = best.releaseDate ? String(best.releaseDate).slice(0, 4) : null;
-    const moodTags = detectMoodTags(`${realTitle} ${genre || ""}`);
-
-    // پیشنهادِ تگ: خواننده + ژانر + آلبوم + حس (هر کدوم که موجود بود)، بدونِ تکراری، حداکثر ۶ تا
-    const suggestedTags = [];
-    const pushTag = (t) => {
-      if (!t) return;
-      const norm = t.trim();
-      if (norm && !suggestedTags.some((x) => x.toLowerCase() === norm.toLowerCase())) suggestedTags.push(norm);
-    };
-    pushTag(artist);
-    pushTag(genre);
-    if (album && album.toLowerCase() !== realTitle.toLowerCase()) pushTag(album);
-    moodTags.forEach(pushTag);
-    if (releaseYear) pushTag(releaseYear);
+    const meta = await searchMusicMetadataChain(q, env);
+    if (!meta) return json({ ok: true, matched: false, suggestions: [] });
 
     return json({
       ok: true,
       matched: true,
-      title: realTitle || null,
-      artist: artist || null,
-      album: album || null,
-      genre: genre || null,
-      releaseYear,
-      artworkUrl: best.artworkUrl100 ? best.artworkUrl100.replace("100x100", "400x400") : null,
-      suggestions: suggestedTags.slice(0, 6),
+      title: meta.title || null,
+      artist: meta.artist || null,
+      album: meta.album || null,
+      genre: meta.genre || null,
+      releaseYear: meta.releaseYear || null,
+      artworkUrl: meta.artworkUrl || null,
+      source: meta.source,
+      suggestions: buildSuggestedTagsFromMeta(meta),
     });
   } catch (err) {
-    console.error("خطای جستجوی iTunes:", err);
+    console.error("خطای جستجویِ موسیقی:", err);
     return json({ ok: true, matched: false, suggestions: [] });
   }
 }
@@ -1370,9 +1538,9 @@ async function handleMusicLookup(request, env) {
 // ---------- برچسب‌گذاریِ گروهیِ آهنگ‌های قدیمی (فقط مالکِ سایت): قبلِ اضافه‌شدنِ سیستمِ تگ، آهنگ‌ها بدونِ
 // تگ آپلود می‌شدن، پس نه دیلی‌میکسِ تگ‌محور و نه ردیفِ «خواننده‌های موردعلاقه» (وقتی audio_performer هم
 // خالیه) شانسی برایِ نشون‌دادن‌شون نداشتن. این اندپوینت هر بار یه دسته‌ی کوچیک از آهنگ‌های بدونِ‌تگ رو
-// می‌گیره، با همون منطقِ جستجویِ iTunesِ handleMusicLookup تگِ پیشنهادی می‌سازه و تویِ post_tags ذخیره می‌کنه؛
-// فرانت این اندپوینت رو تویِ یه حلقه پشتِ‌سرِهم صدا می‌زنه تا کلِ آرشیو تموم بشه (یه درخواستِ تنها برایِ
-// صدها آهنگ به‌خاطرِ محدودیتِ زمانِ اجرایِ Worker و ریت‌لیمیتِ خودِ iTunes امن نیست)
+// می‌گیره، با همون زنجیره‌ی جستجویِ چندمنبعیِ بالا (iTunes→Deezer→Spotify→YouTube) تگِ پیشنهادی می‌سازه
+// و تویِ post_tags ذخیره می‌کنه؛ فرانت این اندپوینت رو تویِ یه حلقه پشتِ‌سرِهم صدا می‌زنه تا کلِ آرشیو
+// تموم بشه (یه درخواستِ تنها برایِ صدها آهنگ به‌خاطرِ محدودیتِ زمانِ اجرایِ Worker امن نیست)
 const MUSIC_BACKFILL_BATCH_SIZE = 12;
 
 async function handleBackfillMusicTags(request, env) {
@@ -1393,6 +1561,7 @@ async function handleBackfillMusicTags(request, env) {
   }
 
   let taggedCount = 0;
+  const bySource = { itunes: 0, deezer: 0, spotify: 0, youtube: 0 };
   const writeStmts = [];
 
   for (const post of candidates) {
@@ -1400,49 +1569,27 @@ async function handleBackfillMusicTags(request, env) {
     if (!q) continue; // هیچی برای سرچ نداریم، بی‌خیالِ این یکی بشو (دفعه‌ی بعد هم دوباره امتحان می‌شه)
 
     try {
-      const apiUrl = `https://itunes.apple.com/search?term=${encodeURIComponent(q)}&media=music&entity=song&limit=1`;
-      const res = await fetch(apiUrl, { headers: { "User-Agent": "dehaat-worker" } });
-      if (!res.ok) continue;
-      const data = await res.json();
-      const results = Array.isArray(data.results) ? data.results : [];
-      if (results.length === 0) continue;
+      const meta = await searchMusicMetadataChain(q, env);
+      if (!meta) continue;
 
-      const best = results[0];
-      const realTitle = cleanTagValue(best.trackName);
-      const artist = cleanTagValue(best.artistName);
-      const album = cleanTagValue(best.collectionName);
-      const genre = cleanTagValue(best.primaryGenreName);
-      const releaseYear = best.releaseDate ? String(best.releaseDate).slice(0, 4) : null;
-      const moodTags = detectMoodTags(`${realTitle} ${genre || ""}`);
-
-      const tags = [];
-      const pushTag = (t) => {
-        if (!t) return;
-        const norm = t.trim();
-        if (norm && !tags.some((x) => x.toLowerCase() === norm.toLowerCase())) tags.push(norm);
-      };
-      pushTag(artist);
-      pushTag(genre);
-      if (album && album.toLowerCase() !== realTitle.toLowerCase()) pushTag(album);
-      moodTags.forEach(pushTag);
-      if (releaseYear) pushTag(releaseYear);
-
+      const tags = buildSuggestedTagsFromMeta(meta);
       if (tags.length === 0) continue;
 
       for (const t of tags) {
         writeStmts.push(env.D1.prepare("INSERT OR IGNORE INTO post_tags (post_id, tag) VALUES (?, ?)").bind(post.id, t));
       }
       // اگه پست از قبل خواننده نداشت، از رویِ نتیجه‌ی سرچ پرش کن — ردیفِ «خواننده‌های موردعلاقه» بهش نیاز داره
-      if (!post.audio_performer && artist) {
-        writeStmts.push(env.D1.prepare("UPDATE posts SET audio_performer = ? WHERE id = ?").bind(artist, post.id));
+      if (!post.audio_performer && meta.artist) {
+        writeStmts.push(env.D1.prepare("UPDATE posts SET audio_performer = ? WHERE id = ?").bind(meta.artist, post.id));
       }
       taggedCount++;
+      if (bySource[meta.source] !== undefined) bySource[meta.source]++;
     } catch (err) {
       console.error("خطای برچسب‌گذاریِ آهنگِ قدیمی:", post.id, err.message);
     }
 
-    // یه فاصله‌ی کوچیک بینِ درخواست‌ها که iTunes رو با برستِ ناگهانی بمباران نکنیم
-    await new Promise((r) => setTimeout(r, 200));
+    // یه فاصله‌ی کوچیک بینِ آهنگ‌ها که هیچ‌کدوم از منبع‌ها رو با برستِ ناگهانی بمباران نکنیم
+    await new Promise((r) => setTimeout(r, 150));
   }
 
   if (writeStmts.length > 0) {
@@ -1460,6 +1607,7 @@ async function handleBackfillMusicTags(request, env) {
     done: remaining === 0,
     processed: candidates.length,
     tagged: taggedCount,
+    bySource,
     remaining,
   });
 }
