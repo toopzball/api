@@ -4217,6 +4217,7 @@ async function fetchFeedPage(env, viewerUsername, opts) {
     sort = "date",
     excludeIds = [],
     unseenOnly = false,
+    search = null,
   } = opts || {};
 
   // پست‌های پین‌شده فقط تویِ فیدِ عادی (سورتِ date) بالای همه میان؛ تویِ «محبوب‌ترین‌ها» و صفِ رندومِ
@@ -4246,6 +4247,12 @@ async function fetchFeedPage(env, viewerUsername, opts) {
   if (unseenOnly && viewerUsername) {
     where.push("id NOT IN (SELECT post_id FROM deel_views WHERE username = ?)");
     params.push(viewerUsername);
+  }
+  // جستجو (فعلاً برای کادرِ سرچِ سگ‌تونز): رویِ عنوان/خواننده/آپلودکننده‌ی آهنگ، حروف‌کوچیک/بزرگ فرقی نداره
+  if (search) {
+    where.push("(LOWER(audio_title) LIKE ? OR LOWER(audio_performer) LIKE ? OR LOWER(username) LIKE ?)");
+    const likeQ = `%${search.toLowerCase()}%`;
+    params.push(likeQ, likeQ, likeQ);
   }
   const whereSql = where.length ? `WHERE ${where.join(" AND ")}` : "";
 
@@ -4353,13 +4360,15 @@ async function handleFeed(request, env) {
     : [];
   // فقط پست‌هایی که این کاربر تا حالا تو Deels ندیده (برای فازِ اولِ الگوریتمِ Deels)
   const unseenOnly = url.searchParams.get("unseenOnly") === "1";
+  // جستجو (مثلاً کادرِ سرچِ آهنگ/خواننده تو سگ‌تونز)
+  const search = (url.searchParams.get("search") || "").trim().slice(0, 100) || null;
 
   // دهات کاملاً خصوصیه؛ فید فقط برای کاربر لاگین‌کرده قابل مشاهده‌ست
   const viewerUsername = await getUserFromToken(request, env);
   if (!viewerUsername) return json({ error: "ابتدا وارد شو" }, 401);
 
   const feedResult = await fetchFeedPage(env, viewerUsername, {
-    page, pageSize, filter, usernameFilter, excludeAudio, sort, excludeIds, unseenOnly,
+    page, pageSize, filter, usernameFilter, excludeAudio, sort, excludeIds, unseenOnly, search,
   });
 
   return json({ ok: true, ...feedResult });
