@@ -5510,31 +5510,13 @@ async function transferOrCleanupOwnedChannels(env, targetUsername) {
 // ---------- حذفِ کاملِ اکانتِ یک کاربر توسط مالک سایت ----------
 // فقط Aghey اجازه داره. برخلافِ بن‌کردن (که فقط یه پرچمه و برگشت‌پذیره)، این کاملاً غیرقابلِ برگشته:
 // اکانت، پروفایل، پست‌ها، کامنت‌ها، پیام‌ها، عضویت‌ها و هر ردی از این کاربر توی همه‌ی جدول‌ها پاک می‌شه.
-async function handleAdminDeleteAccount(request, env) {
-  const username = await getUserFromToken(request, env);
-  if (!username) return json({ error: "ابتدا وارد شو" }, 401);
-  if (!isSuperAdmin(username)) return json({ error: "فقط مالک سایت می‌تونه اکانتِ کاربر رو حذف کنه" }, 403);
-  if (!(await checkRateLimit(env, "admin_delete_account", username, 10, 3600))) {
-    return json({ error: "درخواست زیاد بوده، یه‌کم بعد امتحان کن" }, 429);
-  }
-
-  const body = await request.json().catch(() => ({}));
-  const targetUsername = (body.targetUsername || "").toString().trim();
-  if (!targetUsername) return json({ error: "نام کاربری لازمه" }, 400);
-  if (targetUsername === SUPER_ADMIN_USERNAME) {
-    return json({ error: "نمی‌شه اکانتِ مالک سایت رو حذف کرد" }, 400);
-  }
-
-  const existing = await env.D1.prepare("SELECT username FROM users WHERE username = ?").bind(targetUsername).first();
-  if (!existing) return json({ error: "کاربر پیدا نشد" }, 404);
-
-  // قبل از حذفِ خودِ عضویت‌ها: اگه این کاربر مالکِ یه گروه/کانال بوده، مالکیت خودکار به قدیمی‌ترین
-  // ادمین (یا اگه ادمینی نبود، قدیمی‌ترین عضوِ عادی) منتقل می‌شه؛ اگه هیچ عضوِ دیگه‌ای نمونده باشه،
-  // چون اون گروه/کانال دیگه بی‌فایده و بی‌مالکه، کلاً حذف می‌شه
+// ---------- منطقِ مشترکِ حذفِ کاملِ یه اکانت (هم برای حذفِ ادمین، هم حذفِ خودِ کاربر) ----------
+// قبلاً این لیستِ جدول/ستون‌ها فقط داخلِ handleAdminDeleteAccount بود؛ حالا مشترکه تا حذفِ خودِ
+// کاربر (handleDeleteMyAccount) هم دقیقاً همون پاک‌سازیِ کامل رو انجام بده، بدونِ دوباره‌نویسیِ لیست
+async function performFullAccountDeletion(env, targetUsername) {
   await transferOrCleanupOwnedGroups(env, targetUsername);
   await transferOrCleanupOwnedChannels(env, targetUsername);
 
-  // همون جدول/ستون‌هایی که برای «تغییرِ نام کاربری» هم استفاده می‌شن، به‌علاوه‌ی جدول‌های مربوط به کانال‌ها
   const tableColumns = [
     ["sessions", "username"],
     ["profiles", "username"],
@@ -5559,18 +5541,87 @@ async function handleAdminDeleteAccount(request, env) {
     ["channel_posts", "author_username"],
   ];
 
+  const statements = tableColumns.map(([table, col]) =>
+    env.D1.prepare(`DELETE FROM ${table} WHERE ${col} = ?`).bind(targetUsername)
+  );
+  statements.push(env.D1.prepare("DELETE FROM users WHERE username = ?").bind(targetUsername));
+  await env.D1.batch(statements);
+}
+
+async function handleAdminDeleteAccount(request, env) {
+  const username = await getUserFromToken(request, env);
+  if (!username) return json({ error: "ابتدا وارد شو" }, 401);
+  if (!isSuperAdmin(username)) return json({ error: "فقط مالک سایت می‌تونه اکانتِ کاربر رو حذف کنه" }, 403);
+  if (!(await checkRateLimit(env, "admin_delete_account", username, 10, 3600))) {
+    return json({ error: "درخواست زیاد بوده، یه‌کم بعد امتحان کن" }, 429);
+  }
+
+  const body = await request.json().catch(() => ({}));
+  const targetUsername = (body.targetUsername || "").toString().trim();
+  if (!targetUsername) return json({ error: "نام کاربری لازمه" }, 400);
+  if (targetUsername === SUPER_ADMIN_USERNAME) {
+    return json({ error: "نمی‌شه اکانتِ مالک سایت رو حذف کرد" }, 400);
+  }
+
+  const existing = await env.D1.prepare("SELECT username FROM users WHERE username = ?").bind(targetUsername).first();
+  if (!existing) return json({ error: "کاربر پیدا نشد" }, 404);
+
   try {
-    const statements = tableColumns.map(([table, col]) =>
-      env.D1.prepare(`DELETE FROM ${table} WHERE ${col} = ?`).bind(targetUsername)
-    );
-    statements.push(env.D1.prepare("DELETE FROM users WHERE username = ?").bind(targetUsername));
-    await env.D1.batch(statements);
+    await performFullAccountDeletion(env, targetUsername);
   } catch (err) {
     console.error("خطای حذفِ اکانت:", err);
     return json({ error: "حذفِ اکانت ناموفق بود، دوباره امتحان کن" }, 500);
   }
 
   return json({ ok: true, targetUsername });
+}
+
+// ---------- حذفِ خودِ حسابِ کاربر (منطقه‌ی خطرِ تنظیمات) ----------
+// برخلافِ حذفِ ادمین (که فقط با تایپِ دقیقِ نامِ کاربری تأیید می‌شه)، اینجا چون خودِ صاحبِ حساب داره
+// درخواست می‌ده و برگشت‌ناپذیره، رمزِ عبورِ فعلی هم سمتِ سرور چک می‌شه — دقیقاً همون الگویِ
+// handleChangePassword/handlePasswordVerify (rate-limit روی تلاش‌های ناموفقِ رمز + مقایسه‌ی هش)
+async function handleDeleteMyAccount(request, env) {
+  const username = await getUserFromToken(request, env);
+  if (!username) return json({ error: "ابتدا وارد شو" }, 401);
+  if (username === SUPER_ADMIN_USERNAME) {
+    return json({ error: "نمی‌شه اکانتِ مالک سایت رو از این مسیر حذف کرد" }, 400);
+  }
+
+  if (await isPasswordLocked(env, username)) {
+    return json({ error: "به خاطر تلاش‌های ناموفق زیاد، ۲ دقیقه صبر کن و دوباره امتحان کن" }, 429);
+  }
+  if (!(await checkRateLimit(env, "self_delete_account", username, 5, 3600))) {
+    return json({ error: "درخواست زیاد بوده، یه‌کم بعد امتحان کن" }, 429);
+  }
+
+  let body;
+  try {
+    body = await request.json();
+  } catch (e) {
+    return json({ error: "درخواست نامعتبره" }, 400);
+  }
+
+  const password = (body.password || "").toString();
+  if (!password) return json({ error: "برای حذفِ حساب، رمز عبورت لازمه" }, 400);
+
+  const userData = await env.D1.prepare("SELECT salt, hash FROM users WHERE username = ?").bind(username).first();
+  if (!userData) return json({ error: "کاربر پیدا نشد" }, 404);
+
+  const attemptHash = await hashPassword(password, userData.salt, env);
+  if (attemptHash !== userData.hash) {
+    await registerFailedPasswordAttempt(env, username);
+    return json({ error: "رمز عبور اشتباهه" }, 401);
+  }
+  await kvDelete(env, `pwd_fails:${username}`);
+
+  try {
+    await performFullAccountDeletion(env, username);
+  } catch (err) {
+    console.error("خطای حذفِ حسابِ کاربر:", err);
+    return json({ error: "حذفِ حساب ناموفق بود، دوباره امتحان کن" }, 500);
+  }
+
+  return json({ ok: true });
 }
 
 // #endregion
@@ -8188,6 +8239,9 @@ async function routeRequest(url, request, env, ctx) {
       if (url.pathname === "/api/password/change" && request.method === "POST") {
         return await handleChangePassword(request, env);
       }
+      if (url.pathname === "/api/account/delete" && request.method === "POST") {
+        return await handleDeleteMyAccount(request, env);
+      }
       if (url.pathname === "/api/theme" && request.method === "POST") {
         return await handleUpdateTheme(request, env);
       }
@@ -9276,6 +9330,7 @@ async function handlePlaylistTracks(request, env, playlistId) {
     playlist,
     posts: rows.results || [],
     hasMore: offset + (rows.results || []).length < total,
+    total,
   });
 }
 
