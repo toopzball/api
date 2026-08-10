@@ -596,6 +596,74 @@ async function handleDoozInvitePush(request, env) {
   return json({ ok: true });
 }
 // #endregion
+// #region اندپوینت‌های داخلیِ عمومی — برای وُرکرهایِ بازیِ جدید که رویِ حسابِ جدایِ کلادفلر دیپلوی
+// می‌شن و در نتیجه نمی‌تونن مستقیم به D1ِ اصلی وصل بشن. همه با همون X-Internal-Key محافظت می‌شن.
+function checkInternalKey(request, env) {
+  const internalKey = request.headers.get("X-Internal-Key");
+  return !!(env.INTERNAL_KEY && internalKey === env.INTERNAL_KEY);
+}
+
+// بجایِ اینکه هر وُرکرِ بازی مستقیم به D1 وصل بشه و توکن رو چک کنه، این توکن رو براش verify می‌کنه
+async function handleInternalVerifyToken(request, env) {
+  if (!checkInternalKey(request, env)) return json({ error: "دسترسی نداری" }, 403);
+  const body = await request.json().catch(() => ({}));
+  const token = (body.token || "").trim();
+  if (!token) return json({ error: "توکن لازمه" }, 400);
+
+  const row = await env.D1.prepare(
+    "SELECT sessions.expires_at AS expires_at, users.username AS username, users.banned AS banned " +
+    "FROM sessions JOIN users ON users.username = sessions.username " +
+    "WHERE sessions.token = ?"
+  ).bind(token).first();
+  if (!row || row.banned || row.expires_at < Date.now()) return json({ error: "نامعتبر" }, 401);
+
+  const profile = await env.D1.prepare("SELECT avatar_file_id FROM profiles WHERE username = ?").bind(row.username).first();
+  return json({ ok: true, username: row.username, avatarFileId: (profile && profile.avatar_file_id) || null });
+}
+
+// اضافه/کم‌کردنِ دهپوینتِ یه کاربر (amount می‌تونه منفی هم باشه)؛ همیشه سرور-به-سرور صدا زده می‌شه
+// تا کاربر نتونه خودش امتیاز جعل کنه
+async function handleInternalAwardPoints(request, env) {
+  if (!checkInternalKey(request, env)) return json({ error: "دسترسی نداری" }, 403);
+  const body = await request.json().catch(() => ({}));
+  const username = (body.username || "").trim();
+  const amount = Math.trunc(Number(body.amount));
+  if (!username || !Number.isFinite(amount) || amount === 0) return json({ error: "پارامترها نامعتبرن" }, 400);
+
+  const now = Date.now();
+  await env.D1.prepare(
+    `INSERT INTO dehpoints (username, points, updated_at) VALUES (?, ?, ?)
+     ON CONFLICT(username) DO UPDATE SET points = points + excluded.points, updated_at = excluded.updated_at`
+  ).bind(username, amount, now).run();
+
+  const row = await env.D1.prepare("SELECT points FROM dehpoints WHERE username = ?").bind(username).first();
+  return json({ ok: true, points: (row && row.points) || 0 });
+}
+
+// پروفایلِ خلاصه (آواتار) یه کاربر، برای بازی‌هایی که لازمه چهره‌ی حریف رو نشون بدن
+async function handleInternalProfile(request, env) {
+  if (!checkInternalKey(request, env)) return json({ error: "دسترسی نداری" }, 403);
+  const url = new URL(request.url);
+  const username = (url.searchParams.get("username") || "").trim();
+  if (!username) return json({ error: "username لازمه" }, 400);
+  const profile = await env.D1.prepare("SELECT avatar_file_id FROM profiles WHERE username = ?").bind(username).first();
+  return json({ ok: true, username, avatarFileId: (profile && profile.avatar_file_id) || null });
+}
+
+// مهره‌ی ذخیره‌شده‌ی دوزِ یه کاربر (به‌عنوانِ اسکینِ مشترک بینِ همه‌ی بازی‌های شهربازی)
+async function handleInternalDoozPiece(request, env) {
+  if (!checkInternalKey(request, env)) return json({ error: "دسترسی نداری" }, 403);
+  const url = new URL(request.url);
+  const username = (url.searchParams.get("username") || "").trim();
+  if (!username) return json({ error: "username لازمه" }, 400);
+  try {
+    const row = await env.D1.prepare("SELECT piece FROM dooz_pieces WHERE username = ?").bind(username).first();
+    return json({ ok: true, piece: (row && row.piece) || null });
+  } catch (e) {
+    return json({ ok: true, piece: null });
+  }
+}
+// #endregion
 // ---------- لیستِ کاربرانِ آنلاین ----------
 // صفحه‌بندی با offset ساده‌ست چون این لیست مرتب تغییر می‌کنه (based on لیزی‌لودِ اسکرول، نه URLِ قابلِ بوکمارک)
 async function handleOnlineUsers(request, env) {
@@ -8290,6 +8358,18 @@ async function routeRequest(url, request, env, ctx) {
       }
       if (url.pathname === "/api/internal/dooz-invite-push" && request.method === "POST") {
         return await handleDoozInvitePush(request, env);
+      }
+      if (url.pathname === "/api/internal/verify-token" && request.method === "POST") {
+        return await handleInternalVerifyToken(request, env);
+      }
+      if (url.pathname === "/api/internal/award-points" && request.method === "POST") {
+        return await handleInternalAwardPoints(request, env);
+      }
+      if (url.pathname === "/api/internal/profile" && request.method === "GET") {
+        return await handleInternalProfile(request, env);
+      }
+      if (url.pathname === "/api/internal/dooz-piece" && request.method === "GET") {
+        return await handleInternalDoozPiece(request, env);
       }
       if (url.pathname === "/api/chat/group/update" && request.method === "POST") {
         return await handleChatUpdateGroup(request, env);
