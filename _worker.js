@@ -5079,6 +5079,116 @@ async function handleAdminMe(request, env) {
   return json({ ok: true, admin_rank: rank });
 }
 
+// #endregion
+// #region تیکِ ادمین: عکسِ روی آواتار (مثلِ کلاه) — فقط برایِ سوپرادمین (Aghey)
+// نیازمندیِ D1 (یک‌بار اجرا کن):
+//   ALTER TABLE profiles ADD COLUMN badge_file_id TEXT;
+//   ALTER TABLE profiles ADD COLUMN badge_x REAL;
+//   ALTER TABLE profiles ADD COLUMN badge_y REAL;
+//   ALTER TABLE profiles ADD COLUMN badge_scale REAL;
+//   ALTER TABLE profiles ADD COLUMN badge_rotation REAL;
+// x/y درصدِ محلِ مرکزِ بج نسبت به قطرِ آواتاره (۰ تا ۱۰۰، ۵۰=وسط)، scale نسبتِ اندازه‌ی بج به قطرِ
+// آواتار (مثلاً ۰.۵)، rotation زاویه به درجه. این مقادیر رو خودِ کلاینت با درگ/پینچ روی شبیه‌سازِ
+// آواتار حساب می‌کنه و اینجا فقط ذخیره می‌شن.
+// ---------- گرفتنِ وضعیتِ فعلیِ همه‌ی بج‌ها (عمومیه؛ همه باید بتونن رویِ آواتارِ هر کاربرِ بج‌دار ببیننش) ----------
+// حالا بج فقط مخصوصِ سوپرادمین نیست؛ خودِ سوپرادمین (Aghey) می‌تونه برای هر کاربرِ دیگه‌ای هم جداگانه
+// یه بج بسازه و اپلای کنه. برای همین اینجا بجِ همه‌ی کاربرهایی که بج دارن رو به‌صورتِ یه نقشه برمی‌گردونیم
+// تا سمتِ کلاینت، هرجا آواتارِ هر کاربری رندر می‌شه، بتونه بجِ خودشو نشون بده.
+async function handleGetAdminBadge(request, env) {
+  const rows = await env.D1.prepare(
+    "SELECT username, badge_file_id, badge_x, badge_y, badge_scale, badge_rotation FROM profiles WHERE badge_file_id IS NOT NULL"
+  ).all();
+  const badges = {};
+  for (const row of (rows && rows.results) || []) {
+    badges[row.username] = {
+      fileId: row.badge_file_id,
+      x: row.badge_x ?? 78,
+      y: row.badge_y ?? 18,
+      scale: row.badge_scale ?? 0.5,
+      rotation: row.badge_rotation ?? 0,
+    };
+  }
+  return json({ ok: true, badges });
+}
+
+// ---------- آپلود/جابه‌جاییِ بج (فقط سوپرادمین می‌تونه بسازه؛ می‌تونه برایِ هر کاربرِ دیگه‌ای هم جداگانه بسازه) ----------
+async function handleSetAdminBadge(request, env) {
+  const username = await getUserFromToken(request, env);
+  if (!username) return json({ error: "ابتدا وارد شو" }, 401);
+  if (!isSuperAdmin(username)) return json({ error: "این قابلیت فقط برای مالک سایته" }, 403);
+
+  const form = await request.formData();
+  const targetUsernameRaw = form.get("target_username");
+  const targetUsername = (typeof targetUsernameRaw === "string" && targetUsernameRaw.trim()) || username;
+
+  if (targetUsername !== username) {
+    const targetRow = await env.D1.prepare("SELECT username FROM users WHERE username = ?").bind(targetUsername).first();
+    if (!targetRow) return json({ error: "کاربرِ موردنظر پیدا نشد" }, 404);
+  }
+
+  const imageFile = form.get("image");
+  const hasImage = imageFile && typeof imageFile !== "string" && imageFile.size > 0;
+  const x = Number(form.get("x"));
+  const y = Number(form.get("y"));
+  const scale = Number(form.get("scale"));
+  const rotation = Number(form.get("rotation"));
+
+  const existing = await env.D1.prepare("SELECT badge_file_id FROM profiles WHERE username = ?").bind(targetUsername).first();
+  let badgeFileId = (existing && existing.badge_file_id) || null;
+
+  if (hasImage) {
+    if (!imageFile.type.startsWith("image/")) {
+      return json({ error: "عکسِ بج باید یه فایل تصویر باشه" }, 400);
+    }
+    if (!(await verifyFileMatchesCategory(imageFile, "image"))) {
+      return json({ error: "محتوای فایل با نوع اعلام‌شده‌اش مطابقت نداره" }, 400);
+    }
+    if (imageFile.size > 3 * 1024 * 1024) {
+      return json({ error: "حجمِ عکسِ بج نباید بیشتر از ۳ مگابایت باشه" }, 400);
+    }
+    if (!(await checkRateLimit(env, "badge_upload", username, 10, 600))) {
+      return json({ error: "آپدیتِ بج زیاد بوده، چند دقیقه دیگه امتحان کن" }, 429);
+    }
+    try {
+      const result = await sendTelegramFile(env, "sendDocument", "document", imageFile, `بجِ ادمین — ${targetUsername}`);
+      badgeFileId = extractFileId("document", result);
+    } catch (err) {
+      console.error("خطای آپلودِ بجِ ادمین به تلگرام:", err);
+      return json({ error: "آپلودِ عکسِ بج ناموفق بود، دوباره امتحان کن" }, 502);
+    }
+  }
+
+  if (!badgeFileId) return json({ error: "اول یه عکس برای بج انتخاب کن" }, 400);
+
+  await env.D1.prepare(
+    `UPDATE profiles SET badge_file_id = ?, badge_x = ?, badge_y = ?, badge_scale = ?, badge_rotation = ? WHERE username = ?`
+  ).bind(badgeFileId, x || 78, y || 18, scale || 0.5, rotation || 0, targetUsername).run();
+
+  return json({
+    ok: true,
+    target_username: targetUsername,
+    badge: { fileId: badgeFileId, x: x || 78, y: y || 18, scale: scale || 0.5, rotation: rotation || 0 },
+  });
+}
+
+// ---------- حذفِ بج (فقط سوپرادمین؛ می‌تونه بجِ هر کاربرِ دیگه‌ای رو هم حذف کنه) ----------
+async function handleDeleteAdminBadge(request, env) {
+  const username = await getUserFromToken(request, env);
+  if (!username) return json({ error: "ابتدا وارد شو" }, 401);
+  if (!isSuperAdmin(username)) return json({ error: "این قابلیت فقط برای مالک سایته" }, 403);
+
+  const url = new URL(request.url);
+  const targetUsername = (url.searchParams.get("target_username") || "").trim() || username;
+
+  await env.D1.prepare(
+    `UPDATE profiles SET badge_file_id = NULL, badge_x = NULL, badge_y = NULL, badge_scale = NULL, badge_rotation = NULL WHERE username = ?`
+  ).bind(targetUsername).run();
+
+  return json({ ok: true, target_username: targetUsername });
+}
+
+// #endregion
+
 // ---------- بوت‌استرپِ صفحه‌ی اصلی: چهارتا درخواستِ جداگانه‌ی لود اول (پروفایل/تم، وضعیتِ ادمین،
 // تعدادِ اعلانِ نخونده، و صفحه‌ی اولِ فید) رو تویِ یه رفت‌وبرگشتِ HTTP جمع می‌کنه ----------
 // این مخصوصاً روی کانکشن‌های کند/ناپایدار مهمه: هر رفت‌وبرگشتِ اضافه (نه لزوماً حجمِ دیتا) خودش
@@ -5126,7 +5236,7 @@ async function handleBootstrap(request, env) {
   const url = new URL(request.url);
   const pageSize = Math.min(Math.max(parseInt(url.searchParams.get("pageSize") || "10", 10), 1), 50);
 
-  const [adminRank, profileRow, unreadRow, feedResult, changelogRow, currentChangelog] = await Promise.all([
+  const [adminRank, profileRow, unreadRow, feedResult, changelogRow, currentChangelog, badgeRows] = await Promise.all([
     getAdminRank(env, username),
     env.D1.prepare("SELECT * FROM profiles WHERE username = ?").bind(username).first(),
     (async () => {
@@ -5137,13 +5247,27 @@ async function handleBootstrap(request, env) {
     fetchFeedPage(env, username, { page: 1, pageSize, filter: "media", sort: "date" }),
     env.D1.prepare("SELECT seen_changelog_version FROM users WHERE username = ?").bind(username).first(),
     getCurrentChangelog(env),
+    env.D1.prepare(
+      "SELECT username, badge_file_id, badge_x, badge_y, badge_scale, badge_rotation FROM profiles WHERE badge_file_id IS NOT NULL"
+    ).all(),
   ]);
 
   const seenChangelogVersion = (changelogRow && changelogRow.seen_changelog_version) || null;
+  const adminBadges = {};
+  for (const row of (badgeRows && badgeRows.results) || []) {
+    adminBadges[row.username] = {
+      fileId: row.badge_file_id,
+      x: row.badge_x ?? 78,
+      y: row.badge_y ?? 18,
+      scale: row.badge_scale ?? 0.5,
+      rotation: row.badge_rotation ?? 0,
+    };
+  }
 
   return json({
     ok: true,
     admin_rank: adminRank,
+    admin_badges: adminBadges,
     profile: {
       username,
       avatar_file_id: (profileRow && profileRow.avatar_file_id) || null,
@@ -6219,6 +6343,43 @@ async function handleChatMembers(request, env) {
     myRole: me.role,
     members,
   });
+}
+
+// #endregion
+// #region چت: محتوای گروه/کانال به‌تفکیکِ نوع (تب‌های رسانه/فایل/موزیک/پست‌ها تو پنلِ اطلاعاتِ گروه)
+// ---------- چت: محتوای گروه به‌تفکیکِ نوع ----------
+// نگاشتِ هر تب به msg_type‌های متناظرش تو chat_messages
+const CHAT_CONTENT_TYPE_MAP = {
+  media: ["image", "video"],
+  files: ["file"],
+  music: ["audio"],
+  posts: ["post_shortcut"],
+};
+
+async function handleChatContent(request, env) {
+  const username = await getUserFromToken(request, env);
+  if (!username) return json({ error: "ابتدا وارد شو" }, 401);
+
+  const url = new URL(request.url);
+  const conversationId = url.searchParams.get("conversation");
+  const filterType = url.searchParams.get("type");
+  if (!conversationId) return json({ error: "شناسه‌ی گفتگو لازمه" }, 400);
+  const msgTypes = CHAT_CONTENT_TYPE_MAP[filterType];
+  if (!msgTypes) return json({ error: "نوعِ محتوا نامعتبره" }, 400);
+
+  const me = await getGroupMembership(env, conversationId, username);
+  if (!me) return json({ error: "عضو این گفتگو نیستی" }, 403);
+
+  const before = parseInt(url.searchParams.get("before") || "0", 10) || Date.now() + 1;
+  const placeholders = msgTypes.map(() => "?").join(",");
+  const rows = await env.D1.prepare(
+    `SELECT ${CHAT_MESSAGE_SELECT_COLUMNS} FROM chat_messages
+     WHERE conversation_id = ? AND deleted_at IS NULL AND msg_type IN (${placeholders}) AND created_at < ?
+     ORDER BY created_at DESC LIMIT 30`
+  ).bind(conversationId, ...msgTypes, before).all();
+
+  const messages = (rows.results || []).map(mapChatMessageRow);
+  return json({ messages, hasMore: messages.length === 30 });
 }
 
 // #endregion
@@ -8251,6 +8412,15 @@ async function routeRequest(url, request, env, ctx) {
       if (url.pathname === "/api/admin/me" && request.method === "GET") {
         return await handleAdminMe(request, env);
       }
+      if (url.pathname === "/api/admin/badge" && request.method === "GET") {
+        return await handleGetAdminBadge(request, env);
+      }
+      if (url.pathname === "/api/admin/badge" && request.method === "POST") {
+        return await handleSetAdminBadge(request, env);
+      }
+      if (url.pathname === "/api/admin/badge" && request.method === "DELETE") {
+        return await handleDeleteAdminBadge(request, env);
+      }
       if (url.pathname === "/api/bootstrap" && request.method === "GET") {
         return await handleBootstrap(request, env);
       }
@@ -8463,6 +8633,9 @@ async function routeRequest(url, request, env, ctx) {
       }
       if (url.pathname === "/api/chat/messages" && request.method === "GET") {
         return await handleChatMessages(request, env);
+      }
+      if (url.pathname === "/api/chat/content" && request.method === "GET") {
+        return await handleChatContent(request, env);
       }
       if (url.pathname === "/api/chat/send" && request.method === "POST") {
         return await handleChatSend(request, env);
