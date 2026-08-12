@@ -111,6 +111,12 @@ function bind(stmt, args) {
 //     PRIMARY KEY (post_id, tag)
 //   );
 //   CREATE INDEX IF NOT EXISTS idx_post_tags_tag ON post_tags (tag);
+//
+// migration (سیستمِ جدیدِ «تگِ خودکار/قفل‌شده»): این ستون رو هم اضافه کن — مشخص می‌کنه هر ردیفِ
+// post_tags از کجا اومده: 'auto' (خودِ سیستم از رویِ تگِ ID3/متادیتا ساخته و کاربر هرگز نمی‌تونه حذفش
+// کنه) یا 'user' (خودِ کاربر دستی اضافه کرده و آزادانه قابلِ حذف/ویرایشه). پیشِ‌فرض 'user'ه که ردیف‌های
+// قدیمی هم منطقی بمونن؛ برچسب‌گذاریِ گروهیِ آهنگ‌های قدیمی (handleBackfillMusicTags) صریحاً 'auto' می‌ذاره.
+//   ALTER TABLE post_tags ADD COLUMN source TEXT NOT NULL DEFAULT 'user';
 //   CREATE TABLE IF NOT EXISTS track_plays (
 //     id INTEGER PRIMARY KEY AUTOINCREMENT,
 //     post_id TEXT NOT NULL,
@@ -544,6 +550,11 @@ function randomHex(bytes = 16) {
 //   CREATE INDEX IF NOT EXISTS idx_chat_reactions_message ON chat_message_reactions (message_id);
 // برای ذخیره‌شدنِ واقعیِ تگ‌های پست (نه فقط تزیینیِ پیش‌نمایش)، این ستون رو هم به جدولِ posts اضافه کن:
 //   ALTER TABLE posts ADD COLUMN tags TEXT;
+// migration (سیستمِ جدیدِ «تگِ خودکار/قفل‌شده»): tags فقط تگ‌هایی رو نگه می‌داره که خودِ کاربر دستی
+// اضافه کرده (آزادانه قابلِ حذف/ویرایش با /api/post/edit)؛ auto_tags تگ‌هاییه که خودِ سرور از رویِ
+// تگِ ID3 (audio_title/audio_performer) یا برچسب‌گذاریِ گروهیِ آهنگ‌های قدیمی ساخته — این ستون هرگز از
+// طریقِ /api/post/edit تغییر نمی‌کنه، یعنی هیچ کاربری (حتی صاحبِ پست) نمی‌تونه از این مسیر حذفش کنه:
+//   ALTER TABLE posts ADD COLUMN auto_tags TEXT;
 // نکته: role توی chat_conversation_members از قبل وجود داره؛ الان مقادیر 'owner' / 'admin' / 'member' رو می‌گیره
 async function touchUserPresence(env, username) {
   try {
@@ -1378,6 +1389,39 @@ function cleanTagValue(v) {
   return (v || "").toString().replace(/["'`]/g, "").trim().slice(0, 30);
 }
 
+// ================= تگ‌های خودکارِ قفل‌شده (سرور) =================
+// دقیقاً همون منطقِ deriveAutoLockedTags توی فرانت (از رویِ تکه‌های audio_title/audio_performer که
+// خودِ سرور از تگِ ID3 دریافت کرده)، اما این‌بار روی سرور اجرا می‌شه تا هیچ کلاینتی نتونه با فرستادنِ
+// یه لیستِ دلخواه به‌جایِ تگ‌های واقعیِ ID3، «تگِ خودکار» قلابی جا بزنه یا تگِ خودکارِ واقعی رو حذف کنه.
+// این تگ‌ها هیچ‌وقت از طریقِ /api/post/edit تغییر نمی‌کنن (نگاه کن به handleEditPost).
+const AUTO_TAG_STOPWORDS = new Set(["feat", "feat.", "ft", "ft.", "featuring", "official", "remix", "version", "the", "and", "و"]);
+
+function computeAutoLockedTagsServer(title, performer) {
+  const raw = `${title || ""} ${performer || ""}`;
+  const pieces = raw
+    .split(/[\s,،\-_/|()[\]]+/)
+    .map((t) => t.trim())
+    .filter((t) => t.length >= 2 && !AUTO_TAG_STOPWORDS.has(t.toLowerCase()));
+  const seen = new Set();
+  const out = [];
+  for (const p of pieces) {
+    const key = p.toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(cleanTagValue(p));
+    if (out.length >= 6) break;
+  }
+  return out.filter(Boolean);
+}
+
+// یه لیستِ تگِ کاربر رو نسبت به لیستِ تگ‌های خودکار فیلتر می‌کنه (بدونِ حساسیت به بزرگی/کوچکیِ حروف)؛
+// یعنی اگه کاربر عیناً همون چیزی رو تایپ کنه که قبلاً به‌عنوانِ تگِ خودکار قفل شده، به‌جایِ ذخیره‌ی
+// دوباره‌ش به‌عنوانِ «تگِ کاربر»، نادیده گرفته می‌شه (چون از قبل، به‌شکلِ قفل‌شده، تویِ پست هست)
+function excludeAutoTags(userTags, autoTags) {
+  const autoSet = new Set((autoTags || []).map((t) => t.toLowerCase()));
+  return (userTags || []).filter((t) => !autoSet.has(t.toLowerCase()));
+}
+
 // ---------- منبعِ ۱: iTunes Search API — رایگان، بدون کلید، خروجیِ ساختاریافته و سریع ----------
 async function searchITunesMeta(q) {
   const apiUrl = `https://itunes.apple.com/search?term=${encodeURIComponent(q)}&media=music&entity=song&limit=1`;
@@ -1643,9 +1687,13 @@ async function handleBackfillMusicTags(request, env) {
       const tags = buildSuggestedTagsFromMeta(meta);
       if (tags.length === 0) continue;
 
+      // این تگ‌ها هم دقیقاً مثلِ تگ‌های خودکارِ آپلودِ جدید، source='auto' می‌گیرن و توی ستونِ
+      // auto_tags پست ذخیره می‌شن — یعنی از این به بعد، صاحبِ آهنگ هم نمی‌تونه از طریقِ ویرایشِ پست
+      // حذفشون کنه؛ دقیقاً هماهنگ با قانونِ «تگِ خودکار هرگز توسطِ کاربر قابلِ حذف نیست»
       for (const t of tags) {
-        writeStmts.push(env.D1.prepare("INSERT OR IGNORE INTO post_tags (post_id, tag) VALUES (?, ?)").bind(post.id, t));
+        writeStmts.push(env.D1.prepare("INSERT OR IGNORE INTO post_tags (post_id, tag, source) VALUES (?, ?, 'auto')").bind(post.id, t));
       }
+      writeStmts.push(env.D1.prepare("UPDATE posts SET auto_tags = ? WHERE id = ?").bind(JSON.stringify(tags), post.id));
       // اگه پست از قبل خواننده نداشت، از رویِ نتیجه‌ی سرچ پرش کن — ردیفِ «خواننده‌های موردعلاقه» بهش نیاز داره
       if (!post.audio_performer && meta.artist) {
         writeStmts.push(env.D1.prepare("UPDATE posts SET audio_performer = ? WHERE id = ?").bind(meta.artist, post.id));
@@ -1717,6 +1765,10 @@ async function handleTrackPlay(request, env) {
 // علاقه‌مندی» به‌ازای هر تگ می‌سازیم؛ بعد بینِ آهنگ‌ها (استخرِ نامزدها: جدیدترین/پرطرفدارترین‌ها)،
 // امتیازِ هر آهنگ = مجموعِ امتیازِ تگ‌هاشه + یه کسری امتیازِ محبوبیتِ عمومی (برای مشکلِ کاربرِ تازه‌وارد
 // که هنوز تاریخچه نداره). نتیجه بر اساسِ امتیاز مرتب می‌شه.
+// GET /api/foryou — دقیقاً همون منطقِ امتیازدهیِ ردیفِ «دیلی‌میکس»ِ صفحه‌ی اصلیِ سگ‌تونز (scoreDailyMix)،
+// از همون استخرِ نامزد و همون دیتای علاقه‌مندی تغذیه می‌شه، تا این دو تا هیچ‌وقت از هم جدا/ناهماهنگ نشن.
+// exclude: شناسه‌ی پست‌هایی که نباید دوباره برگردن — هم برای صفحه‌بندیِ دستی (تبِ «برای شما») و هم برای
+// ساختِ صفِ پخشِ آهنگِ بعدی (تا صف هم بر اساسِ همین الگوریتمِ شخصی‌سازی‌شده بچینه، نه رندومِ صرف)
 async function handleForYou(request, env) {
   const username = await getUserFromToken(request, env);
   if (!username) return json({ error: "ابتدا وارد شو" }, 401);
@@ -1724,43 +1776,14 @@ async function handleForYou(request, env) {
   const url = new URL(request.url);
   const page = Math.max(parseInt(url.searchParams.get("page") || "1", 10), 1);
   const pageSize = Math.min(Math.max(parseInt(url.searchParams.get("pageSize") || "10", 10), 1), 50);
+  const excludeIdsParam = url.searchParams.get("exclude");
+  const excludeSet = new Set(
+    excludeIdsParam ? excludeIdsParam.split(",").map((s) => s.trim()).filter(Boolean).slice(0, 300) : []
+  );
 
-  // ۱) رویدادهای علاقه‌مندیِ اخیرِ کاربر (لایک + پخش)، هرکدوم حداکثر ۲۰۰ تای اخیر
-  let likeTagRows = [];
-  let playTagRows = [];
-  try {
-    const [likeRes, playRes] = await env.D1.batch([
-      env.D1.prepare(
-        `SELECT pt.tag AS tag FROM likes l JOIN post_tags pt ON pt.post_id = l.post_id
-         WHERE l.username = ? ORDER BY l.rowid DESC LIMIT 200`
-      ).bind(username),
-      env.D1.prepare(
-        `SELECT pt.tag AS tag, tp.completed AS completed FROM track_plays tp
-         JOIN post_tags pt ON pt.post_id = tp.post_id
-         WHERE tp.username = ? ORDER BY tp.played_at DESC LIMIT 200`
-      ).bind(username),
-    ]);
-    likeTagRows = likeRes.results || [];
-    playTagRows = playRes.results || [];
-  } catch (err) {
-    // اگه جدولِ post_tags/track_plays هنوز ساخته نشده باشه، بی‌صدا رد می‌شیم و می‌ریم سراغِ fallback محبوبیت
-    console.error("خطای گرفتنِ رویدادهای علاقه‌مندی (For You):", err.message);
-  }
-
-  const affinity = {};
-  for (const row of likeTagRows) affinity[row.tag] = (affinity[row.tag] || 0) + 3;
-  for (const row of playTagRows) affinity[row.tag] = (affinity[row.tag] || 0) + (row.completed ? 2 : 1);
-  const hasHistory = Object.keys(affinity).length > 0;
-
-  // ۲) استخرِ نامزدها: آهنگ‌های اخیر/پرطرفدار (سقفِ ۳۰۰ تا، برای اینکه امتیازدهی سبک بمونه)
   let candidates = [];
   try {
-    const poolRes = await env.D1.prepare(
-      `SELECT id, username, title, audio_title, audio_performer, audio_thumb, audio_feeling, file_id,
-              message_id, bot_slot, date, upvotes, downvotes, likes, tags, duration_seconds, type
-       FROM posts WHERE type = 'audio' ORDER BY date DESC LIMIT 300`
-    ).all();
-    candidates = poolRes.results || [];
+    candidates = await fetchAudioCandidatePool(env, 300);
   } catch (err) {
     console.error("خطای گرفتنِ استخرِ نامزدهای For You:", err);
     return json({ error: "الگوریتمِ پیشنهاد فعلاً در دسترس نیست" }, 500);
@@ -1771,78 +1794,22 @@ async function handleForYou(request, env) {
   }
 
   const candidateIds = candidates.map((c) => c.id);
-  const tagsByPost = {};
-  try {
-    const placeholders = candidateIds.map(() => "?").join(",");
-    const tagRes = await bind(env.D1.prepare(`SELECT post_id, tag FROM post_tags WHERE post_id IN (${placeholders})`), candidateIds).all();
-    for (const row of tagRes.results || []) {
-      if (!tagsByPost[row.post_id]) tagsByPost[row.post_id] = [];
-      tagsByPost[row.post_id].push(row.tag);
-    }
-  } catch (err) {
-    console.error("خطای گرفتنِ تگ‌های نامزدها:", err);
-  }
+  const [tagsByPost, affinityData] = await Promise.all([
+    fetchTagsByPost(env, candidateIds),
+    getUserAffinityData(env, username),
+  ]);
 
-  // اکسکلود کردنِ آهنگ‌هایی که کاربر همین اواخر (۲۴ ساعتِ اخیر) گوش داده، تا فید تکراری نشه
-  let recentlyPlayedSet = new Set();
-  try {
-    const recentRes = await env.D1.prepare(
-      "SELECT DISTINCT post_id FROM track_plays WHERE username = ? AND played_at > ?"
-    ).bind(username, Date.now() - 24 * 3600 * 1000).all();
-    recentlyPlayedSet = new Set((recentRes.results || []).map((r) => r.post_id));
-  } catch (err) {}
+  // اکسکلود: هم آهنگ‌هایی که کاربر همین ۲۴ ساعتِ اخیر گوش داده (تا فید تکراری نشه)، هم هرچی صراحتاً
+  // تویِ exclude فرستاده شده (مثلاً آهنگ‌هایی که همین الان تویِ صفِ پخش هستن)
+  const pool = candidates.filter((p) => !affinityData.recentlyPlayedSet.has(p.id) && !excludeSet.has(p.id));
 
-  const scored = candidates
-    .filter((p) => !recentlyPlayedSet.has(p.id))
-    .map((p) => {
-      const postTags = tagsByPost[p.id] || [];
-      let tagScore = 0;
-      for (const t of postTags) tagScore += affinity[t] || 0;
-      const popularity = Math.log(1 + (p.likes || 0) + (p.upvotes || 0));
-      // اگه کاربر هنوز تاریخچه‌ای نداره، فقط محبوبیت تعیین‌کننده‌ست؛ وگرنه علاقه‌مندی وزنِ اصلی رو داره
-      const score = hasHistory ? tagScore * 10 + popularity : popularity;
-      return { post: p, score };
-    })
-    .sort((a, b) => b.score - a.score || b.post.date - a.post.date);
+  const scored = scoreDailyMix(pool, tagsByPost, affinityData);
 
   const total = scored.length;
   const start = (page - 1) * pageSize;
-  const pagePosts = scored.slice(start, start + pageSize).map((s) => ({
-    ...s.post,
-    upvotes: s.post.upvotes || 0,
-    downvotes: s.post.downvotes || 0,
-    likes: s.post.likes || 0,
-    userVote: null,
-    liked: false,
-    comment_count: 0,
-    pinned: false,
-  }));
+  const pagePosts = scored.slice(start, start + pageSize).map((s) => normalizeTrack(s.post));
 
-  // آواتار/لایک/رایِ خودِ کاربر برای همین صفحه (مثلِ fetchFeedPage) تا کارتِ رندرشده کامل باشه
-  if (pagePosts.length > 0) {
-    const uniqueUsernames = [...new Set(pagePosts.map((p) => p.username))];
-    const postIds = pagePosts.map((p) => p.id);
-    try {
-      const [avatarRes, voteRes, likeRes] = await env.D1.batch([
-        bind(env.D1.prepare(`SELECT username, avatar_file_id FROM profiles WHERE username IN (${uniqueUsernames.map(() => "?").join(",")})`), uniqueUsernames),
-        bind(env.D1.prepare(`SELECT post_id, action FROM votes WHERE username = ? AND post_id IN (${postIds.map(() => "?").join(",")})`), [username, ...postIds]),
-        bind(env.D1.prepare(`SELECT post_id FROM likes WHERE username = ? AND post_id IN (${postIds.map(() => "?").join(",")})`), [username, ...postIds]),
-      ]);
-      const avatarMap = {};
-      for (const row of avatarRes.results || []) if (row.avatar_file_id) avatarMap[row.username] = row.avatar_file_id;
-      const voteMap = {};
-      for (const row of voteRes.results || []) voteMap[row.post_id] = row.action;
-      const likeMap = {};
-      for (const row of likeRes.results || []) likeMap[row.post_id] = true;
-      for (const p of pagePosts) {
-        p.avatar_file_id = avatarMap[p.username] || null;
-        p.userVote = voteMap[p.id] || null;
-        p.liked = !!likeMap[p.id];
-      }
-    } catch (err) {
-      console.error("خطای غنی‌سازیِ صفحه‌ی For You:", err);
-    }
-  }
+  await enrichPostsForViewer(env, username, pagePosts);
 
   return json({
     ok: true,
@@ -1851,7 +1818,7 @@ async function handleForYou(request, env) {
     page,
     pageSize,
     hasMore: start + pageSize < total,
-    personalized: hasHistory,
+    personalized: affinityData.hasTagHistory,
   });
 }
 
@@ -2214,6 +2181,9 @@ async function handlePost(request, env) {
   const foodDescription = (form.get("food_description") || "").toString().trim().slice(0, 300);
 
   // تگ‌ها: دقیقاً همون قانونِ تفکیکِ سمتِ کلاینت (با فاصله/کاما جدا می‌شن)، حداکثر ۶ تا و هر کدوم حداکثر ۳۰ کاراکتر
+  // نکته‌ی مهم: این‌ها فقط «تگ‌های کاربر»ن. تگ‌های خودکار/قفل‌شده رو خودِ سرور، مستقلاً و از رویِ
+  // audio_title/audio_performer (که چند خط پایین‌تر دریافت می‌شن)، محاسبه می‌کنه — نه از رویِ چیزی
+  // که کلاینت اینجا فرستاده؛ پس حتی اگه کلاینت دستکاری بشه، نمی‌تونه تگِ خودکارِ قلابی جا بزنه.
   const tagsRaw = (form.get("tags") || "").toString().trim();
   let tags = [];
   if (tagsRaw) {
@@ -2223,12 +2193,18 @@ async function handlePost(request, env) {
       .map((t) => t.slice(0, 30))
       .slice(0, 6);
   }
-  const tagsJson = tags.length ? JSON.stringify(tags) : null;
 
-  // موزیک: هر آهنگ باید حداقل ۲ تگِ جداگانه داشته باشه (برای الگوریتمِ «برای شما»ی سگ‌تونز).
-  // اینجا زودتر از تماس با تلگرام چک می‌شه تا اگه تگ کافی نبود، آپلودِ واقعیِ فایل اصلاً شروع نشه.
   const isAudioUpload = (hasFile && file.type.startsWith("audio/")) || (hasPreUploaded && preUploadedFileType === "audio");
-  if (isAudioUpload && tags.length < 2) {
+  // تگ‌های خودکارِ قفل‌شده: فقط برای موزیک معنی دارن، مستقیماً از تگِ ID3 (audio_title/audio_performer)
+  const autoTags = isAudioUpload ? computeAutoLockedTagsServer(clientAudioTitle, clientAudioPerformer) : [];
+  tags = excludeAutoTags(tags, autoTags).slice(0, 6);
+  const tagsJson = tags.length ? JSON.stringify(tags) : null;
+  const autoTagsJson = autoTags.length ? JSON.stringify(autoTags) : null;
+
+  // موزیک: هر آهنگ باید حداقل ۲ تگِ جداگانه داشته باشه (برای الگوریتمِ «برای شما»ی سگ‌تونز)؛ تگ‌های
+  // خودکار هم جزوِ همین حسابن. اینجا زودتر از تماس با تلگرام چک می‌شه تا اگه تگ کافی نبود، آپلودِ
+  // واقعیِ فایل اصلاً شروع نشه.
+  if (isAudioUpload && (tags.length + autoTags.length) < 2) {
     return json({ error: "برای آهنگ باید حداقل ۲ تگِ جداگانه انتخاب کنی" }, 400);
   }
 
@@ -2375,6 +2351,7 @@ async function handlePost(request, env) {
     audio_feeling: null,
     video_thumb: null,
     tags: tagsJson,
+    auto_tags: autoTagsJson,
     radio_visual: clientRadioVisual && (type === "photo" || type === "video") ? 1 : 0,
     drawing_file_id: drawingFileId,
   };
@@ -2400,10 +2377,10 @@ async function handlePost(request, env) {
   try {
     await bind(
       env.D1.prepare(
-        `INSERT INTO posts (id, username, text, title, type, file_id, message_id, bot_slot, date, upvotes, downvotes, likes, audio_title, audio_performer, audio_thumb, audio_feeling, video_thumb, tags, duration_seconds, radio_visual, drawing_file_id)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+        `INSERT INTO posts (id, username, text, title, type, file_id, message_id, bot_slot, date, upvotes, downvotes, likes, audio_title, audio_performer, audio_thumb, audio_feeling, video_thumb, tags, auto_tags, duration_seconds, radio_visual, drawing_file_id)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
       ),
-      [post.id, post.username, post.text, post.title, post.type, post.file_id, post.message_id, post.bot_slot, post.date, post.audio_title, post.audio_performer, post.audio_thumb, post.audio_feeling, post.video_thumb, post.tags, post.duration_seconds || null, post.radio_visual, post.drawing_file_id]
+      [post.id, post.username, post.text, post.title, post.type, post.file_id, post.message_id, post.bot_slot, post.date, post.audio_title, post.audio_performer, post.audio_thumb, post.audio_feeling, post.video_thumb, post.tags, post.auto_tags, post.duration_seconds || null, post.radio_visual, post.drawing_file_id]
     ).run();
   } catch (err) {
     // اگه اینجا خطا بخوره (مثلاً یه مقدارِ نامعتبر برایِ D1)، قبلاً بدونِ گرفتنش می‌رفت به handlerِ
@@ -2413,13 +2390,17 @@ async function handlePost(request, env) {
     return json({ error: "ذخیره‌ی پست روی سرور ناموفق بود، دوباره امتحان کن" }, 500);
   }
 
-  // نسخه‌ی نرمال‌شده‌ی تگ‌ها هم توی post_tags ذخیره می‌شه (برای جستجو/رتبه‌بندیِ For You)؛
-  // best-effort — اگه شکست بخوره جلویِ ثبتِ خودِ پست رو نمی‌گیره
-  if (tags.length > 0) {
+  // نسخه‌ی نرمال‌شده‌ی تگ‌ها هم توی post_tags ذخیره می‌شه (برای جستجو/رتبه‌بندیِ For You)؛ تگ‌های
+  // خودکار رو اول با source='auto' می‌ذاریم که اگه کاربر عیناً همون رو هم به‌عنوانِ تگِ دستی فرستاده
+  // بود (OR IGNORE)، برچسبِ 'auto' (قفل‌شده) روش بمونه، نه 'user'. best-effort — اگه شکست بخوره
+  // جلویِ ثبتِ خودِ پست رو نمی‌گیره
+  if (autoTags.length > 0 || tags.length > 0) {
     try {
-      await env.D1.batch(
-        tags.map((t) => env.D1.prepare("INSERT OR IGNORE INTO post_tags (post_id, tag) VALUES (?, ?)").bind(id, t))
-      );
+      const tagStmts = [
+        ...autoTags.map((t) => env.D1.prepare("INSERT OR IGNORE INTO post_tags (post_id, tag, source) VALUES (?, ?, 'auto')").bind(id, t)),
+        ...tags.map((t) => env.D1.prepare("INSERT OR IGNORE INTO post_tags (post_id, tag, source) VALUES (?, ?, 'user')").bind(id, t)),
+      ];
+      await env.D1.batch(tagStmts);
     } catch (err) {
       console.error("خطای ذخیره‌ی post_tags:", err);
     }
@@ -3181,7 +3162,7 @@ async function handleMedia(fileId, env, request, ctx) {
   return response;
 }
 
-const MAX_STICKERS_PER_USER = 10;
+const MAX_STICKERS_PER_USER = 20;
 
 // #endregion
 // #region سقف تعداد اعضای گروه چت (به‌جز خودِ سازنده)
@@ -3522,8 +3503,8 @@ async function handleAdminSetReferralPermission(request, env) {
 }
 
 // #endregion
-// #region آپلود استیکر شخصی (عکس یا گیف) به تلگرام؛ سقف ۱۰ تا برای هر کاربر، عمومی و قابل استفاده برای همه
-// ---------- آپلود استیکر شخصی (عکس یا گیف) به تلگرام؛ سقف ۱۰ تا برای هر کاربر، عمومی و قابل استفاده برای همه ----------
+// #region آپلود استیکر شخصی (عکس یا گیف) به تلگرام؛ سقف ۲۰ تا برای هر کاربر، عمومی و قابل استفاده برای همه
+// ---------- آپلود استیکر شخصی (عکس یا گیف) به تلگرام؛ سقف ۲۰ تا برای هر کاربر، عمومی و قابل استفاده برای همه ----------
 async function handleUploadSticker(request, env) {
   const username = await getUserFromToken(request, env);
   if (!username) return json({ error: "ابتدا وارد شو" }, 401);
@@ -4150,29 +4131,48 @@ async function handleEditPost(request, env) {
   if (text.length > 2000) return json({ error: "متن خیلی طولانیه" }, 400);
   if (title.length > 15) return json({ error: "عنوان نباید بیشتر از ۱۵ کاراکتر باشه" }, 400);
 
+  // تگ‌های خودکار/قفل‌شده (auto_tags) هرگز از این مسیر تغییر نمی‌کنن — نه با ارسال‌نکردنشون تویِ
+  // body.tags می‌شه حذفشون کرد، نه با فرستادنِ یه لیستِ دیگه به‌جاشون. همیشه از رویِ خودِ رکوردِ
+  // ذخیره‌شده‌ی پست خونده می‌شن، نه از رویِ چیزی که کلاینت فرستاده؛ یعنی حتی اگه کاربر مستقیم به این
+  // اندپوینت درخواست بزنه (بدونِ عبور از رابطِ کاربری)، بازم نمی‌تونه تگِ خودکار رو حذف/دستکاری کنه.
+  let existingAutoTags = [];
+  try {
+    const parsed = post.auto_tags ? JSON.parse(post.auto_tags) : [];
+    if (Array.isArray(parsed)) existingAutoTags = parsed.filter(Boolean);
+  } catch (e) {
+    existingAutoTags = [];
+  }
+
+  // body.tags از اینجا به بعد فقط «تگ‌های کاربر»ه؛ هرچی عیناً با یه تگِ خودکار یکی باشه، نادیده گرفته
+  // می‌شه (چون از قبل به‌شکلِ قفل‌شده تویِ پست هست و نباید دوباره به‌عنوانِ تگِ آزاد ذخیره بشه)
   const tagsRaw = (body.tags || "").toString().trim();
-  let tags = [];
+  let userTags = [];
   if (tagsRaw) {
-    tags = tagsRaw
+    userTags = tagsRaw
       .split(/[\s,،]+/)
       .filter(Boolean)
       .map((t) => t.slice(0, 30))
       .slice(0, 6);
   }
-  const tagsJson = tags.length ? JSON.stringify(tags) : null;
+  userTags = excludeAutoTags(userTags, existingAutoTags).slice(0, 6);
+  const tagsJson = userTags.length ? JSON.stringify(userTags) : null;
 
-  if (post.type === "audio" && tags.length < 2) {
+  if (post.type === "audio" && (userTags.length + existingAutoTags.length) < 2) {
     return json({ error: "برای آهنگ باید حداقل ۲ تگِ جداگانه انتخاب کنی" }, 400);
   }
 
+  // نکته: auto_tags عمداً تویِ این UPDATE نیست — یعنی هیچ ورودیِ کاربری نمی‌تونه دست بهش بزنه
   await env.D1.prepare("UPDATE posts SET text = ?, title = ?, tags = ?, edited = 1 WHERE id = ?")
     .bind(text || null, title || null, tagsJson, id)
     .run();
 
-  // post_tags رو با تگ‌های جدید همگام می‌کنیم: قبلی‌ها حذف، جدیدها اضافه (best-effort)
+  // post_tags رو با تگ‌های *کاربر* جدید همگام می‌کنیم: فقط ردیف‌های source='user' حذف/جایگزین می‌شن،
+  // ردیف‌های source='auto' (تگ‌های خودکار) دست‌نخورده می‌مونن (best-effort)
   try {
-    const syncStmts = [env.D1.prepare("DELETE FROM post_tags WHERE post_id = ?").bind(id)];
-    for (const t of tags) syncStmts.push(env.D1.prepare("INSERT OR IGNORE INTO post_tags (post_id, tag) VALUES (?, ?)").bind(id, t));
+    const syncStmts = [env.D1.prepare("DELETE FROM post_tags WHERE post_id = ? AND source = 'user'").bind(id)];
+    for (const t of userTags) {
+      syncStmts.push(env.D1.prepare("INSERT OR IGNORE INTO post_tags (post_id, tag, source) VALUES (?, ?, 'user')").bind(id, t));
+    }
     await env.D1.batch(syncStmts);
   } catch (err) {
     console.error("خطای همگام‌سازیِ post_tags در ویرایش:", err);
@@ -4189,7 +4189,7 @@ async function handleEditPost(request, env) {
     // مهم نیست، ادامه می‌دیم
   }
 
-  return json({ ok: true, id, text, title, tags });
+  return json({ ok: true, id, text, title, tags: userTags, autoTags: existingAutoTags });
 }
 
 // #endregion
@@ -5187,6 +5187,131 @@ async function handleDeleteAdminBadge(request, env) {
   return json({ ok: true, target_username: targetUsername });
 }
 
+// #endregion
+// #region شاپِ ده‌دودز: خریدِ آیتم با دهپوینت (اولین آیتم: بجِ اختصاصیِ روی آواتار)
+// نیازمندیِ D1: هیچ ستون/جدولِ جدیدی لازم نیست؛ از همون ستون‌هایِ profiles.badge_* که بالاتر
+// برایِ «بجِ ادمین» ساخته شدن استفاده می‌کنه (هر آواتار فقط یه اسلاتِ بج داره) — یعنی اگه ادمین
+// قبلاً برایِ این کاربر یه بج گذاشته باشه، خریدِ بجِ شاپ جایگزینش می‌شه.
+// دو راهِ پرداخت داره: (۱) نقدی — همیشه ۱۰۰۰ دهپوینت، چه اولین‌بار چه برایِ ادیت/تعویض.
+// (۲) تخفیفِ ویژه با غذا — چندتا آیتمِ از قبل‌خریداری‌شده‌ی یخچال به ارزشِ مجموعِ حداقل ۷۰۰ دهپوینت
+// انتخاب می‌کنه؛ اون غذاها مصرف (حذف) می‌شن، و اگه ارزش‌شون از ۷۰۰ بیشتر بود، باقیمانده به‌صورتِ
+// دهپوینت به حسابش برمی‌گرده.
+const SHOP_BADGE_PRICE_POINTS = 1000;
+const SHOP_BADGE_DISCOUNT_FOOD_POINTS = 700;
+
+async function handleShopBuyBadge(request, env) {
+  const username = await getUserFromToken(request, env);
+  if (!username) return json({ error: "ابتدا وارد شو" }, 401);
+
+  const form = await request.formData();
+  const paymentMethod = (form.get("payment_method") || "points").toString();
+  const x = Number(form.get("x"));
+  const y = Number(form.get("y"));
+  const scale = Number(form.get("scale"));
+  const rotation = Number(form.get("rotation"));
+  const imageFile = form.get("image");
+  const hasImage = imageFile && typeof imageFile !== "string" && imageFile.size > 0;
+
+  const existingRow = await env.D1.prepare("SELECT badge_file_id FROM profiles WHERE username = ?").bind(username).first();
+  let badgeFileId = (existingRow && existingRow.badge_file_id) || null;
+
+  if (!hasImage && !badgeFileId) {
+    return json({ error: "اول یه عکس برای بج انتخاب کن" }, 400);
+  }
+
+  if (hasImage) {
+    if (!imageFile.type.startsWith("image/")) {
+      return json({ error: "عکسِ بج باید یه فایل تصویر باشه" }, 400);
+    }
+    if (!(await verifyFileMatchesCategory(imageFile, "image"))) {
+      return json({ error: "محتوای فایل با نوع اعلام‌شده‌اش مطابقت نداره" }, 400);
+    }
+    if (imageFile.size > 3 * 1024 * 1024) {
+      return json({ error: "حجمِ عکسِ بج نباید بیشتر از ۳ مگابایت باشه" }, 400);
+    }
+  }
+
+  if (!(await checkRateLimit(env, "shop_badge", username, 10, 600))) {
+    return json({ error: "زیاد امتحان کردی، چند دقیقه‌ی دیگه دوباره امتحان کن" }, 429);
+  }
+
+  let refund = 0;
+  let consumedFridgeIds = [];
+
+  if (paymentMethod === "food") {
+    let foodIds = [];
+    try {
+      foodIds = JSON.parse(form.get("food_item_ids") || "[]");
+    } catch {
+      foodIds = [];
+    }
+    foodIds = Array.isArray(foodIds) ? foodIds.filter((id) => typeof id === "string" && id) : [];
+    if (!foodIds.length) return json({ error: "اول چندتا غذا از یخچالت انتخاب کن" }, 400);
+
+    const placeholders = foodIds.map(() => "?").join(",");
+    const rows = await env.D1.prepare(
+      `SELECT id, price_points FROM fridge_items WHERE username = ? AND id IN (${placeholders})`
+    ).bind(username, ...foodIds).all();
+    const foundRows = rows.results || [];
+    if (foundRows.length !== foodIds.length) {
+      return json({ error: "بعضی از غذاهای انتخابی پیدا نشدن (شاید قبلاً مصرف شدن)" }, 400);
+    }
+    const foodTotal = foundRows.reduce((sum, r) => sum + (r.price_points || 0), 0);
+    if (foodTotal < SHOP_BADGE_DISCOUNT_FOOD_POINTS) {
+      return json({ error: `ارزشِ غذاهای انتخابی باید حداقل ${SHOP_BADGE_DISCOUNT_FOOD_POINTS} دهپوینت باشه` }, 400);
+    }
+    refund = foodTotal - SHOP_BADGE_DISCOUNT_FOOD_POINTS;
+    consumedFridgeIds = foundRows.map((r) => r.id);
+  } else {
+    const balanceRow = await env.D1.prepare("SELECT points FROM dehpoints WHERE username = ?").bind(username).first();
+    const balance = (balanceRow && balanceRow.points) || 0;
+    if (balance < SHOP_BADGE_PRICE_POINTS) {
+      return json({ error: "دهپوینتِ کافی نداری" }, 400);
+    }
+  }
+
+  if (hasImage) {
+    try {
+      const result = await sendTelegramFile(env, "sendDocument", "document", imageFile, `بجِ شاپ — ${username}`);
+      badgeFileId = extractFileId("document", result);
+    } catch (err) {
+      console.error("خطای آپلودِ بجِ شاپ به تلگرام:", err);
+      return json({ error: "آپلودِ عکسِ بج ناموفق بود، دوباره امتحان کن" }, 502);
+    }
+  }
+  if (!badgeFileId) return json({ error: "اول یه عکس برای بج انتخاب کن" }, 400);
+
+  const now = Date.now();
+  const batch = [];
+  if (paymentMethod === "food") {
+    const placeholders = consumedFridgeIds.map(() => "?").join(",");
+    batch.push(env.D1.prepare(`DELETE FROM fridge_items WHERE id IN (${placeholders})`).bind(...consumedFridgeIds));
+    if (refund > 0) {
+      batch.push(env.D1.prepare(
+        `INSERT INTO dehpoints (username, points, updated_at) VALUES (?, ?, ?)
+         ON CONFLICT(username) DO UPDATE SET points = points + excluded.points, updated_at = excluded.updated_at`
+      ).bind(username, refund, now));
+    }
+  } else {
+    batch.push(env.D1.prepare(
+      "UPDATE dehpoints SET points = points - ?, updated_at = ? WHERE username = ?"
+    ).bind(SHOP_BADGE_PRICE_POINTS, now, username));
+  }
+  batch.push(env.D1.prepare(
+    `UPDATE profiles SET badge_file_id = ?, badge_x = ?, badge_y = ?, badge_scale = ?, badge_rotation = ? WHERE username = ?`
+  ).bind(badgeFileId, x || 78, y || 18, scale || 0.5, rotation || 0, username));
+
+  await env.D1.batch(batch);
+
+  const newBalanceRow = await env.D1.prepare("SELECT points FROM dehpoints WHERE username = ?").bind(username).first();
+
+  return json({
+    ok: true,
+    badge: { fileId: badgeFileId, x: x || 78, y: y || 18, scale: scale || 0.5, rotation: rotation || 0 },
+    dehpoints: (newBalanceRow && newBalanceRow.points) || 0,
+    refunded: refund,
+  });
+}
 // #endregion
 
 // ---------- بوت‌استرپِ صفحه‌ی اصلی: چهارتا درخواستِ جداگانه‌ی لود اول (پروفایل/تم، وضعیتِ ادمین،
@@ -8504,6 +8629,9 @@ async function routeRequest(url, request, env, ctx) {
       }
       if (url.pathname === "/api/restaurant/fridge" && request.method === "GET") {
         return await handleRestaurantFridge(request, env);
+      }
+      if (url.pathname === "/api/shop/badge" && request.method === "POST") {
+        return await handleShopBuyBadge(request, env);
       }
       if (url.pathname === "/api/notifications" && request.method === "GET") {
         return await handleGetNotifications(request, env);
