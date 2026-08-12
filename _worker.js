@@ -4,7 +4,7 @@
 const SUPER_ADMIN_USERNAME = "Aghey";
 
 // فقط این دامنه‌ها اجازه دارن از مرورگر به این ورکر درخواست بزنن
-const ALLOWED_ORIGINS = ["https://dehaat.faggott.fun", "https://dehaato.pages.dev", "https://dehaat.aghey.faggott.fun", "https://dehaat.bbboi.ir"];
+const ALLOWED_ORIGINS = ["https://dehaat.faggott.fun", "https://dehaato.pages.dev", "https://dehaat.aghey.faggott.fun", "https://aghey.bbboi.ir"];
 
 // بر اساس Origin درخواست، هدرهای CORS مناسب رو می‌سازه
 // (اگه Origin توی لیست مجاز نبود، هدر Allow-Origin اصلاً ست نمی‌شه؛
