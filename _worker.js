@@ -7367,7 +7367,10 @@ async function handleChatReactMessage(request, env) {
   const body = await request.json().catch(() => ({}));
   const conversationId = (body.conversationId || "").toString();
   const messageId = (body.messageId || "").toString();
-  const emoji = (body.emoji || "").toString().trim().slice(0, 8);
+  // سقفِ قبلی ۸ کاراکتر بود که فقط جوابگویِ ایموجیِ یونیکدِ ساده بود؛ شورت‌کدِ ایموجیِ پکیِ سایت به‌شکلِ
+  // :e:<packId>:<fileName>: می‌تونه راحت از ۸ کاراکتر بگذره، پس با همون سقفِ قبلی قطع/خراب می‌شد.
+  // ۶۴ کاراکتر برایِ طولانی‌ترین شورت‌کدِ محتمل (اسمِ پک + اسمِ فایل) کافیه.
+  const emoji = (body.emoji || "").toString().trim().slice(0, 64);
   if (!conversationId || !messageId || !emoji) return json({ error: "اطلاعات لازم ناقصه" }, 400);
 
   const member = await env.D1.prepare(
