@@ -1913,6 +1913,16 @@ function popularityOf(p) {
   return Math.log(1 + (p.likes || 0) + (p.upvotes || 0));
 }
 
+// شافلِ فیشر-یتس — برای رندومایزکردنِ ترتیبِ ردیف‌های خانه‌ی سگ‌تونز (نگاه کن به handleMusicHome)
+function shuffleArrayCopy(arr) {
+  const a = arr.slice();
+  for (let i = a.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [a[i], a[j]] = [a[j], a[i]];
+  }
+  return a;
+}
+
 // ردیفِ ۱: دیلی‌میکس — دقیقاً همون منطقِ امتیازدهیِ «برای شما»یِ بالا (تگ‌محور)
 function scoreDailyMix(candidates, tagsByPost, affinityData) {
   const { tagAffinity, hasTagHistory } = affinityData;
@@ -2040,13 +2050,26 @@ async function handleMusicHome(request, env) {
 
   const usedIds = new Set(); // بینِ ردیف‌ها هم تکراری نشه — هر آهنگ فقط تویِ اولین ردیفی که واجدِ شرایطشه می‌افته
   const sectionResults = {};
+  // ردیف‌هایی که طبقِ درخواست باید هر بار رفرش (باز شدنِ تبِ «برای شما») به‌هم بریزن؛ «discover» عمداً
+  // بیرون از این لیسته چون منطقش اصلاً تازگی‌محوره (جدیدترین آپلودها)، شافل‌کردنش بی‌معنی/گمراه‌کننده‌ست
+  const SHUFFLE_SECTIONS = new Set(["daily_mix", "favorite_artists"]);
+  // قبلاً امتیازدهی کاملاً قطعی بود (همیشه دقیقاً همون ۱۲ تا با همون ترتیب برمی‌گشت، چون سورت فقط بر
+  // اساسِ امتیاز/تاریخ بود و هیچ رندومی توش نبود) — برای اینکه واقعاً هر بار چیدمان/ست فرق کنه، به‌جایِ
+  // سختگیرانه برداشتنِ ۱۲ تای اولِ امتیازِ بالا، از یه استخرِ چندبرابرِ بزرگ‌ترِ آهنگ‌هایِ مرتبط (که همچنان
+  // بر اساسِ همون امتیازدهی فیلتر شده، پس ربط/کیفیت حفظ می‌مونه) به‌صورتِ رندوم ۱۲ تا انتخاب می‌کنیم
+  const SHUFFLE_SLATE_MULTIPLIER = 4;
   for (const sectionId of Object.keys(MUSIC_HOME_SECTIONS)) {
     const scored = SECTION_SCORERS[sectionId](pool, tagsByPost, affinityData);
+    let orderedCandidates = scored.map((s) => s.post);
+    if (SHUFFLE_SECTIONS.has(sectionId)) {
+      const slateSize = Math.min(orderedCandidates.length, ROW_SIZE * SHUFFLE_SLATE_MULTIPLIER);
+      orderedCandidates = shuffleArrayCopy(orderedCandidates.slice(0, slateSize));
+    }
     const picked = [];
-    for (const s of scored) {
-      if (usedIds.has(s.post.id)) continue;
-      picked.push(s.post);
-      usedIds.add(s.post.id);
+    for (const post of orderedCandidates) {
+      if (usedIds.has(post.id)) continue;
+      picked.push(post);
+      usedIds.add(post.id);
       if (picked.length >= ROW_SIZE) break;
     }
     sectionResults[sectionId] = picked;
