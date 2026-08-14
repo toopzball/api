@@ -3762,6 +3762,7 @@ async function createNotification(env, toUsername, data) {
     vote: (d) => `${d.from_username} به پستت رای مثبت داد`,
     marriage_request: (d) => `${d.from_username} تو محضر ازت خواستگاری کرد`,
     marriage_accept: (d) => `${d.from_username} خواستگاریت رو قبول کرد`,
+    restaurant_sale: (d) => `${d.from_username} غذاتُ${d.text ? ` («${d.text}»)` : ""} خرید 🍽️`,
   };
   const bodyBuilder = pushMessages[data.type];
   if (bodyBuilder) {
@@ -4763,7 +4764,7 @@ async function handleRestaurantMenu(request, env) {
   return json({ ok: true, items: rows.results || [] });
 }
 
-async function handleRestaurantBuy(request, env) {
+async function handleRestaurantBuy(request, env, ctx) {
   const username = await getUserFromToken(request, env);
   if (!username) return json({ error: "لطفاً وارد شو" }, 401);
   const body = await request.json().catch(() => ({}));
@@ -4798,6 +4799,16 @@ async function handleRestaurantBuy(request, env) {
       "INSERT INTO fridge_items (id, username, restaurant_item_id, title, file_id, acquired_at, price_points, description) VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
     ).bind(fridgeId, username, item.id, item.title, item.file_id, now, item.price_points, item.description || null),
   ]);
+
+  // اعلان به سرآشپز که غذاش با موفقیت فروخته شد؛ مثلِ بقیه‌ی اعلان‌ها، اگه ctx بود در پس‌زمینه
+  // (بدونِ معطل‌کردنِ جوابِ خریدِ کاربر) و وگرنه (نایابه) قبل از جواب await می‌شه
+  const notifyPromise = createNotification(env, item.chef_username, {
+    type: "restaurant_sale",
+    from_username: username,
+    text: item.title || null,
+  });
+  if (ctx) ctx.waitUntil(notifyPromise);
+  else await notifyPromise;
 
   return json({ ok: true });
 }
@@ -8651,7 +8662,7 @@ async function routeRequest(url, request, env, ctx) {
         return await handleRestaurantMenu(request, env);
       }
       if (url.pathname === "/api/restaurant/buy" && request.method === "POST") {
-        return await handleRestaurantBuy(request, env);
+        return await handleRestaurantBuy(request, env, ctx);
       }
       if (url.pathname === "/api/restaurant/fridge" && request.method === "GET") {
         return await handleRestaurantFridge(request, env);
