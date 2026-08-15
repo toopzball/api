@@ -9754,7 +9754,24 @@ export default {
     const requestOrigin = request.headers.get("Origin");
     const internalKey = request.headers.get("X-Internal-Key");
     const hasValidInternalKey = env.INTERNAL_KEY && internalKey === env.INTERNAL_KEY;
-    const isAllowedDirectOrigin = requestOrigin && ALLOWED_ORIGINS.includes(requestOrigin);
+
+    // تگ‌های <img>/<video>/<audio> (که مدیای خصوصی از همین‌ها لود می‌شه) هدرِ Origin رو
+    // خیلی وقت‌ها نمی‌فرستن — این رفتارِ استانداردِ خودِ مرورگر/وب‌ویو برای بارگذاریِ منبع (resource
+    // load) به‌جای CORS fetch/XHRه، نه یه باگ توی فرانت‌اند. اگه فقط به Origin تکیه کنیم، همین
+    // درخواست‌ها این‌جا رد می‌شن و اصلاً به چکِ توکنِ خودِ handleMedia نمی‌رسن (پستِ متنی مشکلی نداره
+    // چون fetch با Authorization header همیشه Origin می‌فرسته). برای همین وقتی Origin نیست،
+    // به‌عنوانِ fallback از Referer (که این تگ‌ها همیشه می‌فرستن و آدرسِ کاملِ صفحه رو داره) استفاده
+    // می‌کنیم و originِ همون رو با همون لیستِ ALLOWED_ORIGINS چک می‌کنیم.
+    let refererOrigin = null;
+    if (!requestOrigin) {
+      const referer = request.headers.get("Referer");
+      if (referer) {
+        try { refererOrigin = new URL(referer).origin; } catch (e) { refererOrigin = null; }
+      }
+    }
+    const isAllowedDirectOrigin =
+      (requestOrigin && ALLOWED_ORIGINS.includes(requestOrigin)) ||
+      (refererOrigin && ALLOWED_ORIGINS.includes(refererOrigin));
     if (!hasValidInternalKey && !isAllowedDirectOrigin) {
       const denied = json({ error: "دسترسی مستقیم مجاز نیست" }, 403);
       for (const [key, value] of Object.entries(corsHeaders)) {
