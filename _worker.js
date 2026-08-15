@@ -4264,6 +4264,15 @@ async function handleGetSinglePost(request, env) {
   const viewerUsername = await getUserFromToken(request, env);
   if (!viewerUsername) return json({ error: "ابتدا وارد شو" }, 401);
 
+  // اگه بین بازدیدکننده و صاحبِ پست بلاکِ دوطرفه‌ای هست، حتی با لینکِ مستقیم/شناسه‌ی پست هم
+  // نباید دیده بشه — همون رفتاری که تو فیدِ عادی داریم.
+  if (viewerUsername !== post.username) {
+    const blocked = await env.D1.prepare(
+      "SELECT 1 AS ok FROM chat_blocks WHERE (blocker_username = ? AND blocked_username = ?) OR (blocker_username = ? AND blocked_username = ?)"
+    ).bind(viewerUsername, post.username, post.username, viewerUsername).first();
+    if (blocked) return json({ error: "پست پیدا نشد" }, 404);
+  }
+
   const profile = await env.D1.prepare("SELECT avatar_file_id FROM profiles WHERE username = ?").bind(post.username).first();
 
   let userVote = null;
@@ -4345,6 +4354,20 @@ async function fetchFeedPage(env, viewerUsername, opts) {
     where.push("(LOWER(audio_title) LIKE ? OR LOWER(audio_performer) LIKE ? OR LOWER(username) LIKE ?)");
     const likeQ = `%${search.toLowerCase()}%`;
     params.push(likeQ, likeQ, likeQ);
+  }
+  // بلاک: پست‌های کاربرهایی که این viewer بلاک کرده، یا کاربرهایی که این viewer رو بلاک کردن،
+  // از فید حذف می‌شن (هر دو طرف). چون این شرط رویِ خودِ ستونِ username پست‌هاست، هم روی فیدِ عمومی
+  // و هم وقتی usernameFilter رویِ یه پروفایلِ بلاک‌شده باشه (یعنی داری پست‌های اون پروفایل رو صدا
+  // می‌زنی) به‌طورِ یکسان جواب می‌ده: لیست خالی برمی‌گرده.
+  if (viewerUsername) {
+    where.push(
+      `username NOT IN (
+        SELECT blocked_username FROM chat_blocks WHERE blocker_username = ?
+        UNION
+        SELECT blocker_username FROM chat_blocks WHERE blocked_username = ?
+      )`
+    );
+    params.push(viewerUsername, viewerUsername);
   }
   const whereSql = where.length ? `WHERE ${where.join(" AND ")}` : "";
 
@@ -4876,13 +4899,23 @@ async function handleGetProfile(request, env) {
     // اگه جدولِ dehpoints هنوز ساخته نشده باشه، صفر برمی‌گردونیم
   }
 
-  // اگه پروفایل خودش نیست، چک می‌کنیم قبلاً گزارشش داده یا نه
+  // اگه پروفایل خودش نیست، چک می‌کنیم قبلاً گزارشش داده یا نه، و وضعیتِ بلاکِ دوطرفه رو هم می‌گیریم
   let reportedByMe = false;
+  let blockedByMe = false;
+  let blockedMe = false;
   if (viewer !== username) {
     const existingReport = await env.D1.prepare(
       "SELECT id FROM reports WHERE reporter_username = ? AND target_username = ?"
     ).bind(viewer, username).first();
     reportedByMe = !!existingReport;
+
+    const blockRows = await env.D1.prepare(
+      "SELECT blocker_username, blocked_username FROM chat_blocks WHERE (blocker_username = ? AND blocked_username = ?) OR (blocker_username = ? AND blocked_username = ?)"
+    ).bind(viewer, username, username, viewer).all();
+    for (const row of blockRows.results || []) {
+      if (row.blocker_username === viewer) blockedByMe = true;
+      if (row.blocker_username === username) blockedMe = true;
+    }
   }
 
   return json({
@@ -4898,6 +4931,8 @@ async function handleGetProfile(request, env) {
       total_upvotes: (totals && totals.totalUpvotes) || 0,
       total_likes: (totals && totals.totalLikes) || 0,
       reported_by_me: reportedByMe,
+      blocked_by_me: blockedByMe,
+      blocked_me: blockedMe,
       referred_by: user.referred_by || null,
       marriage_title: marriageTitle,
       spouse,
