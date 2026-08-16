@@ -117,6 +117,15 @@ function bind(stmt, args) {
 // کنه) یا 'user' (خودِ کاربر دستی اضافه کرده و آزادانه قابلِ حذف/ویرایشه). پیشِ‌فرض 'user'ه که ردیف‌های
 // قدیمی هم منطقی بمونن؛ برچسب‌گذاریِ گروهیِ آهنگ‌های قدیمی (handleBackfillMusicTags) صریحاً 'auto' می‌ذاره.
 //   ALTER TABLE post_tags ADD COLUMN source TEXT NOT NULL DEFAULT 'user';
+//
+// migration (تشخیصِ خودکارِ OST بازی‌ها با VGMdb): این ستون و این جدول رو هم اضافه کن —
+//   ALTER TABLE posts ADD COLUMN audio_game TEXT;
+//   CREATE TABLE IF NOT EXISTS post_music_info (
+//     post_id TEXT PRIMARY KEY,
+//     game TEXT NOT NULL,
+//     updated_at INTEGER NOT NULL
+//   );
+//   CREATE INDEX IF NOT EXISTS idx_post_music_info_game ON post_music_info (game);
 //   CREATE TABLE IF NOT EXISTS track_plays (
 //     id INTEGER PRIMARY KEY AUTOINCREMENT,
 //     post_id TEXT NOT NULL,
@@ -1592,9 +1601,69 @@ async function searchYouTubeMeta(q, env) {
   };
 }
 
+// ---------- منبعِ ۵ (تخصصیِ موسیقیِ بازی): VGMdb — رایگان، بدونِ کلید. برخلافِ iTunes/Deezer/Spotify که
+// کاتالوگِ OSTِ بازی‌ها توشون خیلی ناقصه (یا اصلاً «بازی» رو به‌عنوانِ یه فیلدِ جدا نمی‌شناسن)، VGMdb
+// دقیقاً برایِ همین ساخته شده: هر آلبوم به یک/چند «product» (بازی/انیمه) وصله، آهنگسازها جدا از
+// خواننده‌ها مشخصن، و «classification» (Original Soundtrack / Arrange / Vocal / Doujin و...) داره.
+// نتیجه رو به همون شکلِ meta استانداردِ بقیه‌ی منابع برمی‌گردونیم، به‌علاوه‌ی دو فیلدِ اضافه:
+// game (اسمِ بازی/محصول) و classification (که به‌جایِ ژانرِ موسیقیایی، دسته‌ی OST رو نشون می‌ده)
+async function searchVGMdbMeta(q) {
+  const searchUrl = `https://vgmdb.info/search/${encodeURIComponent(q)}?format=json`;
+  const res = await fetch(searchUrl, { headers: { "User-Agent": "dehaat-worker" } });
+  if (!res.ok) return null;
+  const data = await res.json();
+  const albumResults = (data.results && data.results.albums) || [];
+  if (albumResults.length === 0) return null;
+  const bestLink = albumResults[0].link; // مثلاً "album/79"
+  if (!bestLink) return null;
+
+  const albumRes = await fetch(`https://vgmdb.info/${bestLink}?format=json`, { headers: { "User-Agent": "dehaat-worker" } });
+  if (!albumRes.ok) return null;
+  const album = await albumRes.json();
+
+  const pickName = (n) => (n && (n.en || n["ja-latn"] || n.ja || Object.values(n)[0])) || null;
+  const composers = Array.isArray(album.composers) ? album.composers.map((c) => pickName(c.names)).filter(Boolean) : [];
+  const products = Array.isArray(album.products) ? album.products.map((p) => pickName(p.names)).filter(Boolean) : [];
+  const albumTitle = pickName(album.names);
+
+  if (!albumTitle && composers.length === 0 && products.length === 0) return null;
+
+  return {
+    title: cleanTagValue(albumTitle),
+    artist: cleanTagValue(composers.join(", ")),
+    album: cleanTagValue(albumTitle),
+    genre: cleanTagValue(album.classification || "موسیقی متن بازی"),
+    game: cleanTagValue(products[0] || null),
+    releaseYear: album.release_date ? String(album.release_date).slice(0, 4) : null,
+    artworkUrl: (album.picture_full || album.picture_small) || null,
+    source: "vgmdb",
+  };
+}
+
+// یه حدسِ سبک: آیا این کوئری/تایتل احتمالاً موسیقیِ متنِ یه بازیه؟ (برایِ اولویت‌دادن به VGMdb تویِ
+// زنجیره، و برایِ تصمیم به این‌که بعد از پیداکردنِ نتیجه از یه منبعِ دیگه هم برایِ «اسمِ بازی» سراغِ
+// VGMdb بریم یا نه)
+function isLikelyGameMusic(text) {
+  const t = (text || "").toLowerCase();
+  return /\bost\b|soundtrack|sound track|original sound|vgm|game music|موسیقی\s*متن|موسیقی\s*بازی|ساندترک/.test(t);
+}
+
 // زنجیره‌ی جستجو: هر منبع رو به‌ترتیب امتحان می‌کنه، به‌محضِ اولین نتیجه‌ی معنی‌دار (خواننده یا ژانر
 // داشته باشه) متوقف می‌شه. خطایِ هر منبع بی‌صدا رد می‌شه و می‌ره سراغِ منبعِ بعدی
 async function searchMusicMetadataChain(q, env) {
+  const gameHint = isLikelyGameMusic(q);
+
+  // اگه کوئری بویِ OST می‌داد، اول سراغِ VGMdb می‌ریم (بهترین منبع برایِ «مالِ کدوم بازیه»)؛
+  // اگه چیزی پیدا نکرد یا کوئری اصلاً OST نبود، می‌ریم سراغِ زنجیره‌ی عادی
+  if (gameHint) {
+    try {
+      const vgmResult = await searchVGMdbMeta(q);
+      if (vgmResult && (vgmResult.artist || vgmResult.game)) return vgmResult;
+    } catch (e) {
+      console.error("خطای منبعِ VGMdb:", e.message);
+    }
+  }
+
   const sources = [
     () => searchITunesMeta(q),
     () => searchDeezerMeta(q),
@@ -1604,11 +1673,33 @@ async function searchMusicMetadataChain(q, env) {
   for (const fn of sources) {
     try {
       const result = await fn();
-      if (result && (result.artist || result.genre)) return result;
+      if (result && (result.artist || result.genre)) {
+        // نتیجه از یکی از منابعِ عمومی پیدا شد؛ اگه کوئری/تایتلِ همون نتیجه بویِ OST می‌داد ولی این
+        // منبع فیلدِ «بازی» نداره (iTunes/Deezer/Spotify/YouTube هیچ‌کدوم «بازی» رو نمی‌شناسن)، یه
+        // تلاشِ اضافه‌ی best-effort با VGMdb می‌زنیم که فقط فیلدِ game رو (بدونِ دست‌زدن به بقیه‌ی
+        // فیلدهایی که این منبعِ دقیق‌تر برای موسیقیِ غیرِبازی برگردونده) اضافه کنیم
+        if (!result.game && isLikelyGameMusic(`${q} ${result.title || ""}`)) {
+          try {
+            const vgmEnrich = await searchVGMdbMeta(q);
+            if (vgmEnrich && vgmEnrich.game) result.game = vgmEnrich.game;
+          } catch (e) { /* غنی‌سازیِ اختیاریه، اگه نشد بی‌خیال */ }
+        }
+        return result;
+      }
     } catch (e) {
       console.error("خطای یکی از منابعِ جستجویِ موسیقی:", e.message);
     }
   }
+
+  // هیچ‌کدوم از منابعِ عمومی چیزی پیدا نکردن؛ آخرین تلاش با VGMdb (برایِ OSTهایِ خیلی نایاب که تویِ
+  // iTunes/Deezer/Spotify اصلاً نیستن ولی تویِ VGMdb هستن)، حتی اگه گیم‌هینتِ اولیه هم نداشتیم
+  if (!gameHint) {
+    try {
+      const vgmFallback = await searchVGMdbMeta(q);
+      if (vgmFallback && (vgmFallback.artist || vgmFallback.game)) return vgmFallback;
+    } catch (e) { /* بی‌خیال */ }
+  }
+
   return null;
 }
 
@@ -1629,7 +1720,15 @@ function buildSuggestedTagsFromMeta(meta) {
   if (meta.album && meta.title && meta.album.toLowerCase() !== meta.title.toLowerCase()) pushTag(meta.album);
   moodTags.forEach(pushTag);
   if (meta.releaseYear) pushTag(meta.releaseYear);
-  return tags.slice(0, 6);
+  // تگِ اسمِ بازی: هم برایِ خودِ کاربر مفیده (فیلترکردن)، هم چون این تگ عیناً تویِ post_tags ذخیره
+  // می‌شه، خودکار وارد همون الگوریتمِ tagAffinity (بخشِ «برای شما»/دیلی‌میکس) می‌شه — یعنی کاربری که
+  // یه OST از یه بازی رو لایک/گوش می‌ده، بقیه‌ی OSTهایِ همون بازی (که با همین تگ آپلود شدن) رو تویِ
+  // فیدش بیشتر می‌بینه، بدونِ نیاز به هیچ منطقِ پیشنهادِ اضافه‌ای
+  if (meta.game) {
+    pushTag(meta.game);
+    pushTag("OST");
+  }
+  return tags.slice(0, 8);
 }
 
 async function handleMusicLookup(request, env) {
@@ -1655,6 +1754,7 @@ async function handleMusicLookup(request, env) {
       artist: meta.artist || null,
       album: meta.album || null,
       genre: meta.genre || null,
+      game: meta.game || null,
       releaseYear: meta.releaseYear || null,
       artworkUrl: meta.artworkUrl || null,
       source: meta.source,
@@ -1664,6 +1764,116 @@ async function handleMusicLookup(request, env) {
     console.error("خطای جستجویِ موسیقی:", err);
     return json({ ok: true, matched: false, suggestions: [] });
   }
+}
+
+// ---------- OST هایِ مرتبط: هم «همین بازی»، هم (اگه کلیدِ IGDB ست شده باشه) «بازی‌هایِ مشابه» ----------
+// نکته: پرکردنِ فیدِ شخصی‌سازی‌شده (دیلی‌میکس/برای‌شما) از قبل با تگِ اسمِ بازی که تویِ
+// buildSuggestedTagsFromMeta اضافه شد، خودکار انجام می‌شه (چون اون تگ عیناً تویِ post_tags می‌شینه و
+// وارد tagAffinity می‌شه). این اندپوینت برایِ یه ویجتِ صریح‌تره: «OST هایِ دیگه‌یِ همین بازی» /
+// «بازی‌هایِ مشابه» رویِ صفحه‌ی خودِ آهنگ.
+
+// ---------- IGDB (اختیاری): فقط اگه IGDB_CLIENT_ID/IGDB_CLIENT_SECRET (از یه اکانتِ توییچِ دولوپر،
+// رایگان) به‌عنوانِ Cloudflare Secret ست شده باشن. هدفش فقط «اسمِ بازی‌هایِ مشابه» برایِ کشفه، نه
+// برچسب‌زدنِ نادرست به خودِ آهنگ (چون این بازی‌ها OST خودِ این آهنگ نیستن) ----------
+async function getIGDBToken(env) {
+  if (!env.IGDB_CLIENT_ID || !env.IGDB_CLIENT_SECRET) return null;
+  const cacheKey = "igdb_token";
+  try {
+    const cached = await kvGet(env, cacheKey);
+    if (cached) return cached;
+  } catch (e) { /* کش نبود، از نو می‌گیریم */ }
+
+  try {
+    const authRes = await fetch(
+      `https://id.twitch.tv/oauth2/token?client_id=${env.IGDB_CLIENT_ID}&client_secret=${env.IGDB_CLIENT_SECRET}&grant_type=client_credentials`,
+      { method: "POST" }
+    );
+    if (!authRes.ok) return null;
+    const authData = await authRes.json();
+    const token = authData.access_token;
+    if (token) await kvPut(env, cacheKey, token, Math.max(60, (authData.expires_in || 3600) - 60));
+    return token || null;
+  } catch (e) {
+    return null;
+  }
+}
+
+async function getSimilarGamesFromIGDB(gameName, env) {
+  const token = await getIGDBToken(env);
+  if (!token) return [];
+  try {
+    const res = await fetch("https://api.igdb.com/v4/games", {
+      method: "POST",
+      headers: {
+        "Client-ID": env.IGDB_CLIENT_ID,
+        "Authorization": `Bearer ${token}`,
+        "Content-Type": "text/plain",
+      },
+      body: `search "${gameName.replace(/"/g, "")}"; fields name,similar_games.name; limit 1;`,
+    });
+    if (!res.ok) return [];
+    const data = await res.json();
+    const best = Array.isArray(data) ? data[0] : null;
+    if (!best || !Array.isArray(best.similar_games)) return [];
+    return best.similar_games.map((g) => cleanTagValue(g.name)).filter(Boolean).slice(0, 8);
+  } catch (e) {
+    console.error("خطای IGDB:", e.message);
+    return [];
+  }
+}
+
+// دیگه پست‌هایِ خودِ سایت که دقیقاً با همین اسمِ بازی تگ شدن (case-insensitive)
+async function getRelatedGameTracks(env, game, excludePostId) {
+  try {
+    const res = await env.D1.prepare(
+      `SELECT posts.id, posts.title, posts.audio_title, posts.audio_performer, posts.audio_thumb, posts.file_id, posts.username
+       FROM post_music_info
+       JOIN posts ON posts.id = post_music_info.post_id
+       WHERE LOWER(post_music_info.game) = LOWER(?) AND post_music_info.post_id != ? AND posts.type = 'audio'
+       ORDER BY posts.date DESC LIMIT 20`
+    ).bind(game, excludePostId || "").all();
+    return res.results || [];
+  } catch (e) {
+    console.error("خطای گرفتنِ OST هایِ مرتبط:", e.message);
+    return [];
+  }
+}
+
+async function handleRelatedOst(request, env) {
+  const username = await getUserFromToken(request, env);
+  if (!username) return json({ error: "ابتدا وارد شو" }, 401);
+
+  if (!(await checkRateLimit(env, "related_ost", username, 30, 300))) {
+    return json({ error: "درخواستِ زیاد، چند دقیقه دیگه امتحان کن" }, 429);
+  }
+
+  const url = new URL(request.url);
+  const postId = (url.searchParams.get("postId") || "").trim();
+  let game = (url.searchParams.get("game") || "").trim().slice(0, 80);
+
+  if (!game && postId) {
+    try {
+      const row = await env.D1.prepare("SELECT game FROM post_music_info WHERE post_id = ?").bind(postId).first();
+      if (row) game = row.game;
+    } catch (e) { /* اگه جدول نبود یا خالی بود، پایین‌تر با game خالی یه پاسخِ خالی برمی‌گردونیم */ }
+  }
+
+  if (!game) return json({ ok: true, game: null, sameGame: [], similarGames: [] });
+
+  const sameGame = await getRelatedGameTracks(env, game, postId);
+
+  // بازی‌هایِ مشابه فقط برایِ «کشف» نشون داده می‌شن (اسمِ بازی، نه لزوماً آهنگِ موجود تویِ سایت)؛
+  // اگه از قبل OSTی از اون بازی‌هایِ مشابه تویِ سایت باشه، اون‌ها رو هم پیوست می‌کنیم
+  let similarGames = [];
+  try {
+    const names = await getSimilarGamesFromIGDB(game, env);
+    similarGames = await Promise.all(
+      names.map(async (name) => ({ game: name, tracks: await getRelatedGameTracks(env, name, postId) }))
+    );
+    similarGames = similarGames.filter((g) => g.tracks.length > 0 || true); // اسمِ بازی رو حتی بدونِ آهنگ هم نشون بده (برایِ کشف)
+  } catch (e) { /* IGDB اختیاریه؛ بدونش هم جواب می‌دیم */ }
+
+  return json({ ok: true, game, sameGame, similarGames });
 }
 
 // ---------- برچسب‌گذاریِ گروهیِ آهنگ‌های قدیمی (فقط مالکِ سایت): قبلِ اضافه‌شدنِ سیستمِ تگ، آهنگ‌ها بدونِ
@@ -1713,6 +1923,17 @@ async function handleBackfillMusicTags(request, env) {
         writeStmts.push(env.D1.prepare("INSERT OR IGNORE INTO post_tags (post_id, tag, source) VALUES (?, ?, 'auto')").bind(post.id, t));
       }
       writeStmts.push(env.D1.prepare("UPDATE posts SET auto_tags = ? WHERE id = ?").bind(JSON.stringify(tags), post.id));
+      // اگه معلوم شد این آهنگِ قدیمی OSTِ یه بازیه، همون‌جوری که تویِ آپلودِ جدید ذخیره می‌شه، اینجا هم
+      // post_music_info و posts.audio_game رو پر می‌کنیم — که هم «OST هایِ مرتبط» برایِ آهنگ‌هایِ قدیمی
+      // هم کار کنه، هم اسمِ بازی از رویِ ویرایشِ پست پاک نشه (چون از ستونِ posts نه post_tags میاد)
+      if (meta.game) {
+        writeStmts.push(
+          env.D1.prepare(
+            "INSERT INTO post_music_info (post_id, game, updated_at) VALUES (?, ?, ?) ON CONFLICT(post_id) DO UPDATE SET game = excluded.game, updated_at = excluded.updated_at"
+          ).bind(post.id, meta.game, Date.now())
+        );
+        writeStmts.push(env.D1.prepare("UPDATE posts SET audio_game = ? WHERE id = ?").bind(meta.game, post.id));
+      }
       // اگه پست از قبل خواننده نداشت، از رویِ نتیجه‌ی سرچ پرش کن — ردیفِ «خواننده‌های موردعلاقه» بهش نیاز داره
       if (!post.audio_performer && meta.artist) {
         writeStmts.push(env.D1.prepare("UPDATE posts SET audio_performer = ? WHERE id = ?").bind(meta.artist, post.id));
@@ -2194,6 +2415,9 @@ async function handlePost(request, env) {
   const hasPreUploaded = !!preUploadedFileId && ["image", "video", "audio"].includes(preUploadedFileType);
   const clientAudioTitle = (form.get("audio_title") || "").toString().trim().slice(0, 60);
   const clientAudioPerformer = (form.get("audio_performer") || "").toString().trim().slice(0, 60);
+  // اسمِ بازی (اگه این آهنگ OST باشه و کلاینت از /api/music/lookup فیلدِ game رو گرفته و فرستاده)؛
+  // اختیاریه — اگه خالی بود، هیچ‌کدوم از منطقِ پایین (post_music_info) اجرا نمی‌شه
+  const clientAudioGame = (form.get("audio_game") || "").toString().trim().slice(0, 80);
   // ۴۳ نه ۴۰: چون کلاینت هر ۱۰ کاراکتر یه خط جدید (\n) اضافه می‌کنه، متنِ ۴۰‌کاراکتریِ فرمت‌شده
   // می‌تونه تا ۳ کاراکتر \n اضافه هم داشته باشه؛ برش با ۴۰ باعث قطع‌شدنِ انتهای خط آخر می‌شد
   const clientAudioFeeling = (form.get("audio_feeling") || "").toString().trim().slice(0, 43);
@@ -2239,6 +2463,30 @@ async function handlePost(request, env) {
   const isAudioUpload = (hasFile && file.type.startsWith("audio/")) || (hasPreUploaded && preUploadedFileType === "audio");
   // تگ‌های خودکارِ قفل‌شده: فقط برای موزیک معنی دارن، مستقیماً از تگِ ID3 (audio_title/audio_performer)
   const autoTags = isAudioUpload ? computeAutoLockedTagsServer(clientAudioTitle, clientAudioPerformer) : [];
+
+  // تگِ خودکارِ «بازی» (برایِ OST): به‌جایِ این‌که مستقیم از audio_game که کلاینت فرستاده استفاده کنیم
+  // (که مثلِ بقیه‌ی ورودی‌هایِ کلاینت قابلِ دستکاریه و اگه بی‌چون‌وچرا قفلش کنیم یعنی هرکسی می‌تونه یه
+  // تگِ آزادِ غیرقابل‌حذف به پستش بچسبونه)، خودِ سرور مستقلاً با همون ID3 title/performerِ معتبر یه
+  // سرچِ VGMdb می‌زنه و فقط اگه خودش هم همون بازی رو تأیید کرد، به‌عنوانِ auto قفلش می‌کنه — دقیقاً
+  // همون منطقِ امنیتیِ computeAutoLockedTagsServer بالا. audio_gameِ کلاینت فقط به‌عنوانِ یه راهنمای
+  // «این احتمالاً OSTه، زحمتِ سرچ رو بکش» استفاده می‌شه، نه به‌عنوانِ دیتایِ قابلِ‌اعتماد.
+  let verifiedGame = null;
+  if (isAudioUpload) {
+    const gameQuery = `${clientAudioTitle || ""} ${clientAudioPerformer || ""}`.trim();
+    if (gameQuery && (isLikelyGameMusic(gameQuery) || clientAudioGame)) {
+      try {
+        const vgm = await searchVGMdbMeta(gameQuery);
+        if (vgm && vgm.game) {
+          verifiedGame = vgm.game;
+          if (!autoTags.some((t) => t.toLowerCase() === verifiedGame.toLowerCase())) autoTags.push(verifiedGame);
+          if (!autoTags.some((t) => t.toLowerCase() === "ost")) autoTags.push("OST");
+        }
+      } catch (e) {
+        console.error("خطای تأییدِ سرورِ تگِ بازی:", e.message);
+      }
+    }
+  }
+
   tags = excludeAutoTags(tags, autoTags).slice(0, 6);
   const tagsJson = tags.length ? JSON.stringify(tags) : null;
   const autoTagsJson = autoTags.length ? JSON.stringify(autoTags) : null;
@@ -2408,6 +2656,7 @@ async function handlePost(request, env) {
     post.audio_thumb = audioCoverFileId || tagFileId(result.audio && result.audio.thumb && result.audio.thumb.file_id, result.__slot) || null;
     post.audio_feeling = clientAudioFeeling || null; // «حس من»: فقط تزیینیه، تو پخش تمام‌صفحه نشون داده می‌شه
     post.duration_seconds = clientAudioDuration;
+    post.audio_game = verifiedGame || null;
   }
   if (type === "video" && result.video) {
     // تلگرام خودش موقع آپلود ویدیو یه فریم رو به‌عنوان تامبنیل می‌سازه؛ همون رو ذخیره می‌کنیم
@@ -2419,10 +2668,10 @@ async function handlePost(request, env) {
   try {
     await bind(
       env.D1.prepare(
-        `INSERT INTO posts (id, username, text, title, type, file_id, message_id, bot_slot, date, upvotes, downvotes, likes, audio_title, audio_performer, audio_thumb, audio_feeling, video_thumb, tags, auto_tags, duration_seconds, radio_visual, drawing_file_id)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+        `INSERT INTO posts (id, username, text, title, type, file_id, message_id, bot_slot, date, upvotes, downvotes, likes, audio_title, audio_performer, audio_thumb, audio_feeling, video_thumb, tags, auto_tags, duration_seconds, radio_visual, drawing_file_id, audio_game)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
       ),
-      [post.id, post.username, post.text, post.title, post.type, post.file_id, post.message_id, post.bot_slot, post.date, post.audio_title, post.audio_performer, post.audio_thumb, post.audio_feeling, post.video_thumb, post.tags, post.auto_tags, post.duration_seconds || null, post.radio_visual, post.drawing_file_id]
+      [post.id, post.username, post.text, post.title, post.type, post.file_id, post.message_id, post.bot_slot, post.date, post.audio_title, post.audio_performer, post.audio_thumb, post.audio_feeling, post.video_thumb, post.tags, post.auto_tags, post.duration_seconds || null, post.radio_visual, post.drawing_file_id, post.audio_game || null]
     ).run();
   } catch (err) {
     // اگه اینجا خطا بخوره (مثلاً یه مقدارِ نامعتبر برایِ D1)، قبلاً بدونِ گرفتنش می‌رفت به handlerِ
@@ -2445,6 +2694,19 @@ async function handlePost(request, env) {
       await env.D1.batch(tagStmts);
     } catch (err) {
       console.error("خطای ذخیره‌ی post_tags:", err);
+    }
+  }
+
+  // اگه این آهنگ OST بود (سرور خودش با VGMdb تأیید کرد، نه فقط چیزی که کلاینت فرستاده)، توی
+  // post_music_info هم ذخیره‌ش می‌کنیم — یه جدولِ جدا و ساختاریافته (به‌جایِ قاطی‌کردن با تگ‌های آزادِ
+  // post_tags) که «OST های دیگه‌یِ همین بازی» رو دقیق و سریع پیدا کنه (نگاه کن به handleRelatedOst). best-effort، مثلِ post_tags
+  if (post.audio_game) {
+    try {
+      await env.D1.prepare(
+        "INSERT INTO post_music_info (post_id, game, updated_at) VALUES (?, ?, ?) ON CONFLICT(post_id) DO UPDATE SET game = excluded.game, updated_at = excluded.updated_at"
+      ).bind(id, post.audio_game, Date.now()).run();
+    } catch (err) {
+      console.error("خطای ذخیره‌ی post_music_info:", err);
     }
   }
 
@@ -4986,7 +5248,7 @@ function normalizeThemeValue(theme) {
 // ---------- فونتِ سایت (مستقل از تم رنگی) ----------
 // یادداشت مایگریشن (یه‌بار توی D1 Console اجرا شه):
 //   ALTER TABLE profiles ADD COLUMN font TEXT;
-const VALID_FONTS = ["vazirmatn", "plex", "handjet"];
+const VALID_FONTS = ["vazirmatn", "plex", "rooyin"];
 function normalizeFontValue(font) {
   return VALID_FONTS.includes(font) ? font : "vazirmatn";
 }
@@ -8555,6 +8817,9 @@ async function routeRequest(url, request, env, ctx) {
       }
       if (url.pathname === "/api/music/lookup" && request.method === "GET") {
         return await handleMusicLookup(request, env);
+      }
+      if (url.pathname === "/api/music/related-ost" && request.method === "GET") {
+        return await handleRelatedOst(request, env);
       }
       if (url.pathname === "/api/admin/music/backfill-tags" && request.method === "POST") {
         return await handleBackfillMusicTags(request, env);
