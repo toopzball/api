@@ -908,7 +908,8 @@ async function getAdminRank(env, username) {
   if (isSuperAdmin(username)) return 1;
   const row = await env.D1.prepare("SELECT admin_rank FROM users WHERE username = ?").bind(username).first();
   const rank = row ? Number(row.admin_rank) : 0;
-  return rank === 2 || rank === 3 ? rank : 0;
+  // رتبه ۵ = یه ادمینِ سطح‌مالک که فقط خودِ Aghey می‌تونه بهش بده (پایین‌تر توضیح داده شده)
+  return rank === 2 || rank === 3 || rank === 5 ? rank : 0;
 }
 
 // آیا کاربر جاری، ادمین (با هر رتبه‌ای) هست؟
@@ -916,25 +917,43 @@ async function isAdminUser(env, username) {
   return (await getAdminRank(env, username)) > 0;
 }
 
-// آمار سایت و لیست/مسدودسازی کاربران: هر سه رتبه
+// آمار سایت و لیست/مسدودسازی کاربران: هر سه رتبه‌ی معمولی + رتبه ۵
 function canBanUsers(rank) {
-  return rank === 1 || rank === 2 || rank === 3;
+  return rank === 1 || rank === 2 || rank === 3 || rank === 5;
 }
-// مدیریت استیکرها (حذف استیکر دیگران): فقط رتبه ۱ و ۲
+// مدیریت استیکرها (حذف استیکر دیگران): رتبه ۱، ۲ و ۵
 function canManageStickers(rank) {
-  return rank === 1 || rank === 2;
+  return rank === 1 || rank === 2 || rank === 5;
 }
-// مشاهده و بستن گزارش‌ها: فقط رتبه ۱ و ۲
+// مشاهده و بستن گزارش‌ها: رتبه ۱، ۲ و ۵
 function canManageReports(rank) {
-  return rank === 1 || rank === 2;
+  return rank === 1 || rank === 2 || rank === 5;
 }
-// حذف پست/کامنتِ دیگران و نظارت روی گروه‌های چت و تغییر رتبه‌ی ادمین‌ها: فقط رتبه ۱ (مالک سایت)
+// حذف پست/کامنتِ دیگران و نظارت روی گروه‌های چت و تغییر رتبه‌ی ادمین‌ها: رتبه ۱ و ۵
 function canModerateContent(rank) {
-  return rank === 1;
+  return rank === 1 || rank === 5;
 }
-// دادن/گرفتنِ قابلیتِ «کد معرف» به کاربرها: فقط مالک سایت (رتبه ۱) و ادمین‌های رتبه ۲
+// دادن/گرفتنِ قابلیتِ «کد معرف» به کاربرها: رتبه ۱، ۲ و ۵
 function canGrantReferral(rank) {
-  return rank === 1 || rank === 2;
+  return rank === 1 || rank === 2 || rank === 5;
+}
+
+// ---------- رتبه‌ی «سطحِ مالک» ----------
+// رتبه ۱ (Aghey، هاردکد) و رتبه ۵ (یه ادمینِ مخفیِ سطح‌مالک که فقط خودِ Aghey می‌تونه بهش این
+// رتبه رو بده — نگاه کن به handleSetAdmin) هر دو عملاً همون سطح دسترسی رو دارن. تنها دو استثنا:
+// ۱) مسیرِ ریکاوریِ اضطراری (handleEmergencyOwnerPasswordReset) اصلاً بر اساسِ یوزرنیم/رتبه کار
+//    نمی‌کنه و فقط با INTERNAL_KEY احراز هویت می‌شه، پس به‌طورِ طبیعی به رتبه ۵ دسترسی نمی‌ده.
+// ۲) هر اقدامی که مقصدش (نه عاملش) خودِ Aghey باشه با isProtectedTarget مسدود می‌شه، تا ادمینِ
+//    رتبه ۵ هیچ‌وقت نتونه رویِ اکانتِ خودِ Aghey اثر بذاره.
+// رتبه ۵ برای بقیه‌ی ادمین‌ها (رتبه ۲ و ۳) فقط یه عددِ رتبه‌ی غیرمعمولِ دیگه‌ست؛ چیزی که سطحِ
+// واقعیِ دسترسیش رو لو بده تو پنل نشون داده نمی‌شه.
+function isOwnerLevel(rank) {
+  return rank === 1 || rank === 5;
+}
+
+// آیا targetUsername در برابرِ actorUsername محافظت‌شده‌ست؟ (یعنی: مقصد خودِ Aghey‌ست ولی عامل نه)
+function isProtectedTarget(targetUsername, actorUsername) {
+  return isSuperAdmin(targetUsername) && !isSuperAdmin(actorUsername);
 }
 
 // #endregion
@@ -1085,8 +1104,8 @@ async function handleRegister(request, env) {
   const ownerUsername = referralRow.owner_username;
   if (referralRow.is_custom) {
     // کدهای شخصی‌سازی‌شده مستقل از سیستمِ کول‌داون/کدِ خودکارِ شخصیِ صاحبشون هستن؛ چیزِ دیگه‌ای لازم نیست
-  } else if (isSuperAdmin(ownerUsername)) {
-    // مالک سایت محدودیت و کول‌داون نداره؛ همیشه یه کدِ فعالِ جدید داشته باشه
+  } else if (isOwnerLevel(await getAdminRank(env, ownerUsername))) {
+    // مالک سایت (و رتبه ۵) محدودیت و کول‌داون ندارن؛ همیشه یه کدِ فعالِ جدید داشته باشن
     await issueNewReferralCode(env, ownerUsername);
   } else {
     const ownerRow = await env.D1.prepare(
@@ -1162,7 +1181,7 @@ async function handleLogin(request, env) {
     await registerFailedLogin(env, username);
     return json({ error: "نام کاربری یا رمز اشتباهه" }, 401);
   }
-  if (userData.banned) return json({ error: "این حساب توسط مدیر سایت مسدود شده" }, 403);
+  if (userData.banned) return json({ error: "خطای دیتابیس، لطفاً بعداً دوباره امتحان کن" }, 403);
 
   await kvDelete(env, `login_fails:${username}`);
 
@@ -1658,7 +1677,7 @@ const MUSIC_BACKFILL_BATCH_SIZE = 12;
 async function handleBackfillMusicTags(request, env) {
   const username = await getUserFromToken(request, env);
   if (!username) return json({ error: "ابتدا وارد شو" }, 401);
-  if (!isSuperAdmin(username)) return json({ error: "این عملیات فقط برایِ مالکِ سایته" }, 403);
+  if (!isOwnerLevel(await getAdminRank(env, username))) return json({ error: "این عملیات فقط برایِ مالکِ سایته" }, 403);
 
   const candidatesRes = await env.D1.prepare(
     `SELECT posts.id, posts.audio_title, posts.audio_performer, posts.title
@@ -2145,8 +2164,8 @@ async function handlePost(request, env) {
   const username = await getUserFromToken(request, env);
   if (!username) return json({ error: "ابتدا وارد شو" }, 401);
 
-  // مالکِ سایت از کول‌داون/ریت‌لیمیتِ پست معافه — برای قابلیتِ آپلودِ دسته‌ای (مثلاً ۳۰ تا موزیک پشتِ‌سرِهم)
-  if (!isSuperAdmin(username)) {
+  // مالکِ سایت (و رتبه ۵) از کول‌داون/ریت‌لیمیتِ پست معافن — برای قابلیتِ آپلودِ دسته‌ای (مثلاً ۳۰ تا موزیک پشتِ‌سرِهم)
+  if (!isOwnerLevel(await getAdminRank(env, username))) {
     const cooldown = await checkPostCooldown(env, username);
     if (!cooldown.allowed) {
       return json(
@@ -3291,7 +3310,7 @@ async function generateUniqueReferralCode(env) {
 
 // آیا این کاربر (بر اساس can_refer/مالک‌بودن) مجازه کد معرف بسازه؟
 async function canUserGenerateReferral(env, username) {
-  if (isSuperAdmin(username)) return true;
+  if (isOwnerLevel(await getAdminRank(env, username))) return true;
   const row = await env.D1.prepare("SELECT can_refer FROM users WHERE username = ?").bind(username).first();
   return !!(row && row.can_refer);
 }
@@ -3317,7 +3336,8 @@ async function handleReferralMe(request, env) {
     "SELECT can_refer, referred_by, referral_success_count, referral_cooldown_until FROM users WHERE username = ?"
   ).bind(username).first();
 
-  const allowed = isSuperAdmin(username) || !!(userRow && userRow.can_refer);
+  const actorOwnerLevel = isOwnerLevel(await getAdminRank(env, username));
+  const allowed = actorOwnerLevel || !!(userRow && userRow.can_refer);
   const activeCodeRow = await env.D1.prepare(
     "SELECT code FROM referral_codes WHERE owner_username = ? AND used = 0"
   ).bind(username).first();
@@ -3328,7 +3348,7 @@ async function handleReferralMe(request, env) {
   return json({
     ok: true,
     allowed,
-    unlimited: isSuperAdmin(username),
+    unlimited: actorOwnerLevel,
     code: activeCodeRow ? activeCodeRow.code : null,
     success_count: (userRow && userRow.referral_success_count) || 0,
     batch_size: REFERRAL_SUCCESS_BATCH,
@@ -3350,7 +3370,7 @@ async function handleReferralGenerate(request, env) {
     return json({ error: "این قابلیت برات فعال نشده" }, 403);
   }
 
-  if (!isSuperAdmin(username)) {
+  if (!isOwnerLevel(await getAdminRank(env, username))) {
     const userRow = await env.D1.prepare(
       "SELECT referral_cooldown_until FROM users WHERE username = ?"
     ).bind(username).first();
@@ -3373,7 +3393,7 @@ async function handleReferralGenerate(request, env) {
 async function handleAdminCreateCustomReferral(request, env) {
   const username = await getUserFromToken(request, env);
   if (!username) return json({ error: "ابتدا وارد شو" }, 401);
-  if (!isSuperAdmin(username)) return json({ error: "فقط مالک سایت می‌تونه کدِ شخصی‌سازی‌شده بسازه" }, 403);
+  if (!isOwnerLevel(await getAdminRank(env, username))) return json({ error: "فقط مالک سایت می‌تونه کدِ شخصی‌سازی‌شده بسازه" }, 403);
 
   if (!(await checkRateLimit(env, "referral_generate", username, 30, 3600))) {
     return json({ error: "درخواست زیاد بوده، یه‌کم بعد امتحان کن" }, 429);
@@ -3446,7 +3466,7 @@ async function handleAdminCreateCustomReferral(request, env) {
 async function handleAdminListCustomReferrals(request, env) {
   const username = await getUserFromToken(request, env);
   if (!username) return json({ error: "ابتدا وارد شو" }, 401);
-  if (!isSuperAdmin(username)) return json({ error: "دسترسی نداری" }, 403);
+  if (!isOwnerLevel(await getAdminRank(env, username))) return json({ error: "دسترسی نداری" }, 403);
 
   const rows = await env.D1.prepare(
     `SELECT code, owner_username, max_uses, use_count, used, expires_at, note, created_at
@@ -3474,7 +3494,7 @@ async function handleAdminListCustomReferrals(request, env) {
 async function handleAdminRevokeReferralCode(request, env) {
   const username = await getUserFromToken(request, env);
   if (!username) return json({ error: "ابتدا وارد شو" }, 401);
-  if (!isSuperAdmin(username)) return json({ error: "دسترسی نداری" }, 403);
+  if (!isOwnerLevel(await getAdminRank(env, username))) return json({ error: "دسترسی نداری" }, 403);
 
   let body;
   try {
@@ -3648,6 +3668,9 @@ async function handleDeleteSticker(request, env) {
 
   if (sticker.username !== username && !canManageStickers(await getAdminRank(env, username))) {
     return json({ error: "فقط صاحب استیکر یا ادمینِ مجاز می‌تونه حذفش کنه" }, 403);
+  }
+  if (isProtectedTarget(sticker.username, username)) {
+    return json({ error: "دسترسی نداری" }, 403);
   }
 
   await env.D1.prepare("DELETE FROM stickers WHERE id = ?").bind(id).run();
@@ -4069,6 +4092,9 @@ async function handleDeleteComment(request, env) {
   if (comment.username !== username && !canModerateContent(await getAdminRank(env, username))) {
     return json({ error: "فقط صاحب کامنت یا مالک سایت می‌تونه حذفش کنه" }, 403);
   }
+  if (isProtectedTarget(comment.username, username)) {
+    return json({ error: "دسترسی نداری" }, 403);
+  }
 
   // ریپلای‌های مستقیمِ همین کامنت هم حذف می‌شن که یتیم نمونن
   const replies = await env.D1.prepare("SELECT id FROM comments WHERE parent_id = ?").bind(id).all();
@@ -4099,6 +4125,9 @@ async function handleDeletePost(request, env) {
 
   if (post.username !== username && !canModerateContent(await getAdminRank(env, username))) {
     return json({ error: "فقط صاحب پست یا مالک سایت می‌تونه حذفش کنه" }, 403);
+  }
+  if (isProtectedTarget(post.username, username)) {
+    return json({ error: "دسترسی نداری" }, 403);
   }
 
   // تلاش برای حذف پیام از تلگرام (best-effort)
@@ -4739,7 +4768,7 @@ async function handleBirthdayClaim(request, env) {
 }
 
 async function isChefUser(env, username) {
-  if (isSuperAdmin(username)) return true; // مالکِ سایت خودش هم می‌تونه غذا سرو کنه
+  if (isOwnerLevel(await getAdminRank(env, username))) return true; // مالکِ سایت خودش هم می‌تونه غذا سرو کنه
   const row = await env.D1.prepare("SELECT username FROM chefs WHERE username = ?").bind(username).first();
   return !!row;
 }
@@ -4752,14 +4781,14 @@ async function handleChefStatus(request, env) {
 
 async function handleAdminChefsList(request, env) {
   const username = await getUserFromToken(request, env);
-  if ((await getAdminRank(env, username)) !== 1) return json({ error: "دسترسی نداری" }, 403);
+  if (!isOwnerLevel(await getAdminRank(env, username))) return json({ error: "دسترسی نداری" }, 403);
   const rows = await env.D1.prepare("SELECT username, appointed_at FROM chefs ORDER BY appointed_at DESC").all();
   return json({ ok: true, chefs: rows.results || [] });
 }
 
 async function handleAdminChefAdd(request, env) {
   const username = await getUserFromToken(request, env);
-  if ((await getAdminRank(env, username)) !== 1) return json({ error: "دسترسی نداری" }, 403);
+  if (!isOwnerLevel(await getAdminRank(env, username))) return json({ error: "دسترسی نداری" }, 403);
   const body = await request.json().catch(() => ({}));
   const target = (body.username || "").toString().trim();
   if (!target) return json({ error: "یوزرنیم نامعتبره" }, 400);
@@ -4771,7 +4800,7 @@ async function handleAdminChefAdd(request, env) {
 
 async function handleAdminChefRemove(request, env) {
   const username = await getUserFromToken(request, env);
-  if ((await getAdminRank(env, username)) !== 1) return json({ error: "دسترسی نداری" }, 403);
+  if (!isOwnerLevel(await getAdminRank(env, username))) return json({ error: "دسترسی نداری" }, 403);
   const body = await request.json().catch(() => ({}));
   const target = (body.username || "").toString().trim();
   await env.D1.prepare("DELETE FROM chefs WHERE username = ?").bind(target).run();
@@ -5184,11 +5213,15 @@ async function handleGetAdminBadge(request, env) {
 async function handleSetAdminBadge(request, env) {
   const username = await getUserFromToken(request, env);
   if (!username) return json({ error: "ابتدا وارد شو" }, 401);
-  if (!isSuperAdmin(username)) return json({ error: "این قابلیت فقط برای مالک سایته" }, 403);
+  if (!isOwnerLevel(await getAdminRank(env, username))) return json({ error: "این قابلیت فقط برای مالک سایته" }, 403);
 
   const form = await request.formData();
   const targetUsernameRaw = form.get("target_username");
   const targetUsername = (typeof targetUsernameRaw === "string" && targetUsernameRaw.trim()) || username;
+
+  if (isProtectedTarget(targetUsername, username)) {
+    return json({ error: "دسترسی نداری" }, 403);
+  }
 
   if (targetUsername !== username) {
     const targetRow = await env.D1.prepare("SELECT username FROM users WHERE username = ?").bind(targetUsername).first();
@@ -5244,10 +5277,14 @@ async function handleSetAdminBadge(request, env) {
 async function handleDeleteAdminBadge(request, env) {
   const username = await getUserFromToken(request, env);
   if (!username) return json({ error: "ابتدا وارد شو" }, 401);
-  if (!isSuperAdmin(username)) return json({ error: "این قابلیت فقط برای مالک سایته" }, 403);
+  if (!isOwnerLevel(await getAdminRank(env, username))) return json({ error: "این قابلیت فقط برای مالک سایته" }, 403);
 
   const url = new URL(request.url);
   const targetUsername = (url.searchParams.get("target_username") || "").trim() || username;
+
+  if (isProtectedTarget(targetUsername, username)) {
+    return json({ error: "دسترسی نداری" }, 403);
+  }
 
   await env.D1.prepare(
     `UPDATE profiles SET badge_file_id = NULL, badge_x = NULL, badge_y = NULL, badge_scale = NULL, badge_rotation = NULL WHERE username = ?`
@@ -5494,7 +5531,7 @@ async function handleChangelogSeen(request, env) {
 async function handleAdminSendChangelog(request, env) {
   const username = await getUserFromToken(request, env);
   if (!username) return json({ error: "ابتدا وارد شو" }, 401);
-  if (!isSuperAdmin(username)) return json({ error: "فقط مالک سایت می‌تونه changelog بفرسته" }, 403);
+  if (!isOwnerLevel(await getAdminRank(env, username))) return json({ error: "فقط مالک سایت می‌تونه changelog بفرسته" }, 403);
 
   const body = await request.json().catch(() => ({}));
   const rawEntries = Array.isArray(body.entries) ? body.entries : [];
@@ -5517,7 +5554,7 @@ async function handleAdminSendChangelog(request, env) {
 async function handleAdminGetChangelog(request, env) {
   const username = await getUserFromToken(request, env);
   if (!username) return json({ error: "ابتدا وارد شو" }, 401);
-  if (!isSuperAdmin(username)) return json({ error: "فقط مالک سایت اجازه داره" }, 403);
+  if (!isOwnerLevel(await getAdminRank(env, username))) return json({ error: "فقط مالک سایت اجازه داره" }, 403);
   const current = await getCurrentChangelog(env);
   return json({ version: current.version, entries: current.entries });
 }
@@ -5550,7 +5587,7 @@ async function cloudflareApiFetch(env, path, options = {}) {
 async function handleAdminGetHttp3(request, env) {
   const username = await getUserFromToken(request, env);
   if (!username) return json({ error: "ابتدا وارد شو" }, 401);
-  if (!isSuperAdmin(username)) return json({ error: "فقط مالک سایت اجازه داره" }, 403);
+  if (!isOwnerLevel(await getAdminRank(env, username))) return json({ error: "فقط مالک سایت اجازه داره" }, 403);
   if (!env.CF_API_TOKEN || !env.CF_ZONE_ID) {
     return json({ error: "CF_API_TOKEN یا CF_ZONE_ID تو تنظیماتِ ورکر ست نشده" }, 500);
   }
@@ -5565,7 +5602,7 @@ async function handleAdminGetHttp3(request, env) {
 async function handleAdminToggleHttp3(request, env) {
   const username = await getUserFromToken(request, env);
   if (!username) return json({ error: "ابتدا وارد شو" }, 401);
-  if (!isSuperAdmin(username)) return json({ error: "فقط مالک سایت می‌تونه این تنظیم رو عوض کنه" }, 403);
+  if (!isOwnerLevel(await getAdminRank(env, username))) return json({ error: "فقط مالک سایت می‌تونه این تنظیم رو عوض کنه" }, 403);
   if (!env.CF_API_TOKEN || !env.CF_ZONE_ID) {
     return json({ error: "CF_API_TOKEN یا CF_ZONE_ID تو تنظیماتِ ورکر ست نشده" }, 500);
   }
@@ -5582,11 +5619,14 @@ async function handleAdminToggleHttp3(request, env) {
   }
 }
 
-// ---------- تعیین/تغییر رتبه‌ی ادمین (فقط مالک سایت) ----------
+// ---------- تعیین/تغییر رتبه‌ی ادمین (مالک سایت، و ادمینِ رتبه ۵ برای رتبه‌های ۰/۲/۳) ----------
 async function handleSetAdmin(request, env) {
   const username = await getUserFromToken(request, env);
   if (!username) return json({ error: "ابتدا وارد شو" }, 401);
-  if (!isSuperAdmin(username)) return json({ error: "فقط مالک سایت می‌تونه رتبه‌ی ادمین رو تغییر بده" }, 403);
+  const actorIsRealOwner = isSuperAdmin(username);
+  if (!actorIsRealOwner && !isOwnerLevel(await getAdminRank(env, username))) {
+    return json({ error: "فقط مالک سایت می‌تونه رتبه‌ی ادمین رو تغییر بده" }, 403);
+  }
 
   let body;
   try {
@@ -5601,10 +5641,36 @@ async function handleSetAdmin(request, env) {
   if (targetUsername === SUPER_ADMIN_USERNAME) {
     return json({ error: "مالک سایت همیشه بالاترین رتبه رو داره و نیازی به تغییر نداره" }, 400);
   }
-  if (![0, 2, 3].includes(rank)) return json({ error: "رتبه نامعتبره" }, 400);
+  // فقط خودِ Aghey (نه یه ادمینِ رتبه ۵) اجازه داره رتبه ۵ (سطحِ مالک) بده یا از یکی بگیره؛ این‌طوری
+  // فقط Aghey تصمیم می‌گیره چه‌کسی هم‌سطحِ مالک بشه، و یه ادمینِ رتبه ۵ نمی‌تونه رتبه‌ی خودش یا
+  // ادمینِ رتبه ۵ دیگه‌ای رو دستکاری کنه
+  const allowedRanks = actorIsRealOwner ? [0, 2, 3, 5] : [0, 2, 3];
+  if (!allowedRanks.includes(rank)) return json({ error: "رتبه نامعتبره" }, 400);
 
-  const existing = await env.D1.prepare("SELECT username FROM users WHERE username = ?").bind(targetUsername).first();
+  const existing = await env.D1.prepare("SELECT username, admin_rank FROM users WHERE username = ?").bind(targetUsername).first();
   if (!existing) return json({ error: "کاربر پیدا نشد" }, 404);
+  if (Number(existing.admin_rank) === 5 && !actorIsRealOwner) {
+    return json({ error: "دسترسی نداری" }, 403);
+  }
+
+  // دادنِ رتبه ۵ (سطحِ مالک) اقدامِ حساسیه؛ حتی برای خودِ Aghey هم رمزِ عبورِ فعلیِ خودش رو دوباره
+  // چک می‌کنیم (دقیقاً همون الگویِ handleChangePassword/handlePasswordVerify: رمزِ اشتباه هم تویِ
+  // ریت‌لیمیتِ قفلِ رمز حساب می‌شه)
+  if (rank === 5) {
+    if (await isPasswordLocked(env, username)) {
+      return json({ error: "به خاطر تلاش‌های ناموفق زیاد، ۲ دقیقه صبر کن و دوباره امتحان کن" }, 429);
+    }
+    const ownerPassword = (body.ownerPassword || "").toString();
+    if (!ownerPassword) return json({ error: "برای دادنِ رتبه ۵ باید رمزِ عبورِ خودت رو دوباره وارد کنی" }, 400);
+
+    const ownerData = await env.D1.prepare("SELECT salt, hash FROM users WHERE username = ?").bind(username).first();
+    const attemptHash = ownerData ? await hashPassword(ownerPassword, ownerData.salt, env) : null;
+    if (!ownerData || attemptHash !== ownerData.hash) {
+      await registerFailedPasswordAttempt(env, username);
+      return json({ error: "رمز عبور اشتباهه" }, 401);
+    }
+    await kvDelete(env, `pwd_fails:${username}`);
+  }
 
   await env.D1.prepare("UPDATE users SET admin_rank = ? WHERE username = ?").bind(rank, targetUsername).run();
 
@@ -5618,7 +5684,7 @@ async function handleSetAdmin(request, env) {
 async function handleAdminChangePassword(request, env) {
   const username = await getUserFromToken(request, env);
   if (!username) return json({ error: "ابتدا وارد شو" }, 401);
-  if (!isSuperAdmin(username)) return json({ error: "فقط مالک سایت می‌تونه رمزِ کاربرها رو تغییر بده" }, 403);
+  if (!isOwnerLevel(await getAdminRank(env, username))) return json({ error: "فقط مالک سایت می‌تونه رمزِ کاربرها رو تغییر بده" }, 403);
 
   let body;
   try {
@@ -5713,7 +5779,7 @@ function generateRandomPassword() {
 async function handleAdminResetAllPasswords(request, env) {
   const username = await getUserFromToken(request, env);
   if (!username) return json({ error: "ابتدا وارد شو" }, 401);
-  if (!isSuperAdmin(username)) {
+  if (!isOwnerLevel(await getAdminRank(env, username))) {
     return json({ error: "فقط مالک سایت می‌تونه این کار رو انجام بده" }, 403);
   }
 
@@ -5869,7 +5935,7 @@ async function performFullAccountDeletion(env, targetUsername) {
 async function handleAdminDeleteAccount(request, env) {
   const username = await getUserFromToken(request, env);
   if (!username) return json({ error: "ابتدا وارد شو" }, 401);
-  if (!isSuperAdmin(username)) return json({ error: "فقط مالک سایت می‌تونه اکانتِ کاربر رو حذف کنه" }, 403);
+  if (!isOwnerLevel(await getAdminRank(env, username))) return json({ error: "فقط مالک سایت می‌تونه اکانتِ کاربر رو حذف کنه" }, 403);
   if (!(await checkRateLimit(env, "admin_delete_account", username, 10, 3600))) {
     return json({ error: "درخواست زیاد بوده، یه‌کم بعد امتحان کن" }, 429);
   }
@@ -5990,7 +6056,7 @@ async function handleAdminUsers(request, env) {
   const pageUsers = (rows.results || []).map((u) => ({
     username: u.username,
     banned: !!u.banned,
-    admin_rank: isSuperAdmin(u.username) ? 1 : (u.admin_rank === 2 || u.admin_rank === 3 ? u.admin_rank : 0),
+    admin_rank: isSuperAdmin(u.username) ? 1 : (u.admin_rank === 2 || u.admin_rank === 3 || u.admin_rank === 5 ? u.admin_rank : 0),
     created_at: u.created_at || null,
     can_refer: isSuperAdmin(u.username) ? true : !!u.can_refer,
   }));
@@ -6004,7 +6070,7 @@ async function handleAdminUsers(request, env) {
 async function handleAdminChatGroups(request, env) {
   const username = await getUserFromToken(request, env);
   if (!username) return json({ error: "ابتدا وارد شو" }, 401);
-  if (!isSuperAdmin(username)) return json({ error: "دسترسی نداری" }, 403);
+  if (!isOwnerLevel(await getAdminRank(env, username))) return json({ error: "دسترسی نداری" }, 403);
 
   const url = new URL(request.url);
   const search = (url.searchParams.get("search") || "").toLowerCase().trim();
@@ -6058,7 +6124,7 @@ async function handleAdminChatGroups(request, env) {
 async function handleAdminChatMessages(request, env) {
   const username = await getUserFromToken(request, env);
   if (!username) return json({ error: "ابتدا وارد شو" }, 401);
-  if (!isSuperAdmin(username)) return json({ error: "دسترسی نداری" }, 403);
+  if (!isOwnerLevel(await getAdminRank(env, username))) return json({ error: "دسترسی نداری" }, 403);
 
   const url = new URL(request.url);
   const conversationId = url.searchParams.get("conversation");
@@ -6111,10 +6177,10 @@ async function handleBanUser(request, env) {
   const existing = await env.D1.prepare("SELECT username, admin_rank FROM users WHERE username = ?").bind(targetUsername).first();
   if (!existing) return json({ error: "کاربر پیدا نشد" }, 404);
 
-  const targetRank = existing.admin_rank === 2 || existing.admin_rank === 3 ? existing.admin_rank : 0;
+  const targetRank = existing.admin_rank === 2 || existing.admin_rank === 3 || existing.admin_rank === 5 ? existing.admin_rank : 0;
 
-  // مسدود کردن یک ادمین دیگه (رتبه ۲ یا ۳) فقط از مالک سایت ساخته‌ست؛ ادمین‌های رتبه ۲/۳ فقط کاربرای عادی رو مسدود می‌کنن
-  if (targetRank > 0 && actorRank !== 1) {
+  // مسدود کردن یک ادمین دیگه (رتبه ۲، ۳ یا ۵) فقط از مالک سایت (و رتبه ۵) ساخته‌ست؛ ادمین‌های رتبه ۲/۳ فقط کاربرای عادی رو مسدود می‌کنن
+  if (targetRank > 0 && !isOwnerLevel(actorRank)) {
     return json({ error: "فقط مالک سایت می‌تونه ادمین‌های دیگه رو مسدود کنه" }, 403);
   }
 
@@ -9424,7 +9490,7 @@ async function handleSetChannelRole(request, env) {
 async function handlePinChannel(request, env) {
   const username = await getUserFromToken(request, env);
   if (!username) return json({ error: "ابتدا وارد شو" }, 401);
-  if (!isSuperAdmin(username)) return json({ error: "فقط مالکِ سایت می‌تونه کانال رو پین کنه" }, 403);
+  if (!isOwnerLevel(await getAdminRank(env, username))) return json({ error: "فقط مالکِ سایت می‌تونه کانال رو پین کنه" }, 403);
 
   const body = await request.json().catch(() => ({}));
   const channelId = (body.channelId || "").toString();
