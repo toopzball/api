@@ -6452,6 +6452,67 @@ async function handleBanUser(request, env) {
 }
 
 // #endregion
+// #region گروپ‌بندیِ اعلان‌ها به‌ازایِ هر پست (فقط برایِ حالتِ ?grouped=1)
+// ---------- گروپ‌بندیِ اعلان‌ها به‌ازایِ هر پست (فقط برایِ حالتِ ?grouped=1) ----------
+// به‌جایِ یه ردیفِ جدا برایِ هر کامنت/آپ‌ووت، اعلان‌هایِ نوعِ vote و comment/reply که به یه پستِ
+// واحد مربوطن رو تویِ یه آیتم جمع می‌کنه: «فلان و فلان و X نفر دیگه به پستت آپ‌ووت دادن» یا
+// «... زیرِ پستت کامنت گذاشتن» + آخرین کامنت. ترتیبِ ورودی (rows) باید already بر اساسِ
+// date DESC باشه، چون این‌جا اولین موردِ هر گروه (جدیدترین) به‌عنوانِ نماینده‌ی گروه در نظر
+// گرفته می‌شه. سایرِ انواع (ازدواج، رستوران و ...) دست‌نخورده و تکی می‌مونن.
+function groupNotificationRows(rows, postTitleMap) {
+  const groups = [];
+  const groupByKey = new Map();
+
+  for (const n of rows) {
+    const isVote = n.type === "vote";
+    const isComment = n.type === "comment" || n.type === "reply";
+
+    if ((isVote || isComment) && n.post_id) {
+      const key = `${isVote ? "vote" : "comment"}:${n.post_id}`;
+      let g = groupByKey.get(key);
+      if (!g) {
+        g = {
+          id: n.id,
+          type: isVote ? "vote_group" : "comment_group",
+          post_id: n.post_id,
+          post_title: postTitleMap[n.post_id] || null,
+          date: n.date,
+          actors: [],
+          actor_count: 0,
+          last_comment_text: null,
+          last_comment_id: null,
+        };
+        groups.push(g);
+        groupByKey.set(key, g);
+      }
+      if (n.from_username && !g.actors.includes(n.from_username)) {
+        g.actors.push(n.from_username);
+        g.actor_count++;
+      }
+      if (isComment && g.last_comment_text === null) {
+        // اولین موردی که به این گروه می‌رسیم جدیدترینه (چون ورودی نزولیه)، پس آخرین کامنت همینه
+        g.last_comment_text = n.text || null;
+        g.last_comment_id = n.comment_id || null;
+      }
+    } else {
+      groups.push({
+        id: n.id,
+        type: n.type,
+        post_id: n.post_id || null,
+        post_title: n.post_id ? (postTitleMap[n.post_id] || null) : null,
+        date: n.date,
+        actors: n.from_username ? [n.from_username] : [],
+        actor_count: n.from_username ? 1 : 0,
+        last_comment_text: n.text || null,
+        last_comment_id: n.comment_id || null,
+      });
+    }
+  }
+
+  return groups;
+}
+
+// #endregion
 // #region گرفتن لیست اعلان‌های کاربر
 // ---------- گرفتن لیست اعلان‌های کاربر ----------
 async function handleGetNotifications(request, env) {
@@ -6461,14 +6522,10 @@ async function handleGetNotifications(request, env) {
   const url = new URL(request.url);
   const page = Math.max(parseInt(url.searchParams.get("page") || "1", 10), 1);
   const pageSize = Math.min(Math.max(parseInt(url.searchParams.get("pageSize") || "20", 10), 1), 50);
-
-  const totalRow = await env.D1.prepare("SELECT COUNT(*) as c FROM notifications WHERE to_username = ?").bind(username).first();
-  const total = totalRow ? totalRow.c : 0;
-
-  const start = (page - 1) * pageSize;
-  const rows = await env.D1.prepare(
-    "SELECT * FROM notifications WHERE to_username = ? ORDER BY date DESC LIMIT ? OFFSET ?"
-  ).bind(username, pageSize, start).all();
+  // grouped=1 فقط برایِ صفحه‌ی لیستِ اعلان‌ها (زنگوله) استفاده می‌شه؛ پولینگِ پاپ‌آپِ زنده و
+  // چکِ بج بدونِ این پارامتر صدا زده می‌شن، پس شکلِ خروجی‌شون دقیقاً مثلِ قبل (تکی/اتمیک) می‌مونه
+  // و اعلامِ جداگانه‌ی هر اتفاق (چه پاپ‌آپِ توی‌اپ، چه پوشِ FCM سمتِ اندروید) دست‌نخورده باقی می‌مونه.
+  const grouped = url.searchParams.get("grouped") === "1";
 
   const lastReadRow = await env.D1.prepare("SELECT last_read FROM notif_read WHERE username = ?").bind(username).first();
   const lastRead = lastReadRow ? lastReadRow.last_read : 0;
@@ -6476,9 +6533,57 @@ async function handleGetNotifications(request, env) {
   const unreadRow = await env.D1.prepare("SELECT COUNT(*) as c FROM notifications WHERE to_username = ? AND date > ?").bind(username, lastRead).first();
   const unreadCount = unreadRow ? unreadRow.c : 0;
 
-  // عنوان پست‌های مرتبط با همین صفحه از اعلان‌ها رو یک‌جا می‌گیریم (نه یکی‌یکی)، تا مشخص بشه
-  // هر اعلان زیر کدوم پسته — دقیقاً مثل الگوی avatarMap توی handleFeed
-  const notifRows = rows.results || [];
+  if (!grouped) {
+    const totalRow = await env.D1.prepare("SELECT COUNT(*) as c FROM notifications WHERE to_username = ?").bind(username).first();
+    const total = totalRow ? totalRow.c : 0;
+
+    const start = (page - 1) * pageSize;
+    const rows = await env.D1.prepare(
+      "SELECT * FROM notifications WHERE to_username = ? ORDER BY date DESC LIMIT ? OFFSET ?"
+    ).bind(username, pageSize, start).all();
+
+    // عنوان پست‌های مرتبط با همین صفحه از اعلان‌ها رو یک‌جا می‌گیریم (نه یکی‌یکی)، تا مشخص بشه
+    // هر اعلان زیر کدوم پسته — دقیقاً مثل الگوی avatarMap توی handleFeed
+    const notifRows = rows.results || [];
+    const uniquePostIds = [...new Set(notifRows.map((n) => n.post_id).filter(Boolean))];
+    const postTitleMap = {};
+    if (uniquePostIds.length > 0) {
+      const placeholders = uniquePostIds.map(() => "?").join(",");
+      const titleRows = await env.D1.prepare(
+        `SELECT id, title FROM posts WHERE id IN (${placeholders})`
+      ).bind(...uniquePostIds).all();
+      for (const row of titleRows.results || []) {
+        if (row.title) postTitleMap[row.id] = row.title;
+      }
+    }
+
+    const pageNotifs = notifRows.map((n) => ({
+      ...n,
+      is_new: n.date > lastRead,
+      post_title: n.post_id ? (postTitleMap[n.post_id] || null) : null,
+    }));
+
+    return json({
+      ok: true,
+      notifications: pageNotifs,
+      total,
+      page,
+      pageSize,
+      hasMore: start + pageSize < total,
+      unread_count: unreadCount,
+    });
+  }
+
+  // ---------- حالتِ گروپ‌بندی‌شده ----------
+  // چون یه گروه ممکنه از چندین ردیفِ خام تشکیل بشه، پیجینیشن رو رویِ نتیجه‌ی گروپ‌شده انجام
+  // می‌دیم، نه رویِ ردیف‌های خام؛ برایِ این کار یه پنجره‌ی نسبتاً بزرگ از جدیدترین ردیف‌های خام
+  // (حداکثر ۳۰۰ تا) رو می‌گیریم و بینشون گروپ‌بندی می‌کنیم.
+  const RAW_WINDOW = 300;
+  const rawRows = await env.D1.prepare(
+    "SELECT * FROM notifications WHERE to_username = ? ORDER BY date DESC LIMIT ?"
+  ).bind(username, RAW_WINDOW).all();
+  const notifRows = rawRows.results || [];
+
   const uniquePostIds = [...new Set(notifRows.map((n) => n.post_id).filter(Boolean))];
   const postTitleMap = {};
   if (uniquePostIds.length > 0) {
@@ -6491,19 +6596,21 @@ async function handleGetNotifications(request, env) {
     }
   }
 
-  const pageNotifs = notifRows.map((n) => ({
-    ...n,
-    is_new: n.date > lastRead,
-    post_title: n.post_id ? (postTitleMap[n.post_id] || null) : null,
-  }));
+  const allGroups = groupNotificationRows(notifRows, postTitleMap)
+    .sort((a, b) => b.date - a.date)
+    .map((g) => ({ ...g, is_new: g.date > lastRead }));
+
+  const start = (page - 1) * pageSize;
+  const pageGroups = allGroups.slice(start, start + pageSize);
+  const hasMore = start + pageSize < allGroups.length || notifRows.length === RAW_WINDOW;
 
   return json({
     ok: true,
-    notifications: pageNotifs,
-    total,
+    notifications: pageGroups,
+    total: allGroups.length,
     page,
     pageSize,
-    hasMore: start + pageSize < total,
+    hasMore,
     unread_count: unreadCount,
   });
 }
