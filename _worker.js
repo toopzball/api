@@ -4122,26 +4122,33 @@ async function handleAddComment(request, env, ctx) {
     parentComment = await env.D1.prepare("SELECT * FROM comments WHERE id = ? AND post_id = ?").bind(parent_id, post_id).first();
   }
 
-  // تلاش برای ثبت به صورت ریپلای زیر پست اصلی در تلگرام (best-effort، اگه شکست بخوره مشکلی نیست)
+  // تلاش برای ثبت به صورت ریپلای زیر پست اصلی در تلگرام (best-effort، اگه شکست بخوره مشکلی نیست).
+  // قبلاً این fetch با await جلوی کل تابع رو می‌گرفت، یعنی کاربر تا وقتی تلگرام جواب نمی‌داد
+  // (که می‌تونه چند صد میلی‌ثانیه یا بیشتر طول بکشه) اصلاً جوابِ «کامنتت ثبت شد» رو نمی‌گرفت؛
+  // چون best-effort هست و نتیجه‌ش جایی استفاده نمی‌شه، با ctx.waitUntil می‌بریمش پس‌زمینه.
   const noticeText = type === "sticker" ? "یک استیکر فرستاد" : text;
-  try {
-    if (post && post.message_id) {
-      const prefix = parentComment ? `ریپلای به ${parentComment.username} از طرف ${username}` : `کامنت از ${username}`;
-      // این یه پیامِ یک‌باره‌ی جدیده (نه ویرایش/حذفِ پیامِ قبلی)، پس می‌شه آزادانه بینِ دو بات رندوم کرد
-      const { token: noticeToken } = pickTelegramBot(env);
-      await fetch(`https://api.telegram.org/bot${noticeToken}/sendMessage`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          chat_id: env.CHANNEL_ID,
-          text: `${prefix}:\n${noticeText}`,
-          reply_to_message_id: post.message_id,
-        }),
-      });
+  const sendTelegramNotice = async () => {
+    try {
+      if (post && post.message_id) {
+        const prefix = parentComment ? `ریپلای به ${parentComment.username} از طرف ${username}` : `کامنت از ${username}`;
+        // این یه پیامِ یک‌باره‌ی جدیده (نه ویرایش/حذفِ پیامِ قبلی)، پس می‌شه آزادانه بینِ دو بات رندوم کرد
+        const { token: noticeToken } = pickTelegramBot(env);
+        await fetch(`https://api.telegram.org/bot${noticeToken}/sendMessage`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            chat_id: env.CHANNEL_ID,
+            text: `${prefix}:\n${noticeText}`,
+            reply_to_message_id: post.message_id,
+          }),
+        });
+      }
+    } catch (err) {
+      // مهم نیست؛ کامنت مستقل از تلگرام هم ذخیره می‌شه
     }
-  } catch (err) {
-    // مهم نیست؛ کامنت مستقل از تلگرام هم ذخیره می‌شه
-  }
+  };
+  if (ctx) ctx.waitUntil(sendTelegramNotice());
+  else await sendTelegramNotice();
 
   const id = `${Date.now()}_${randomHex(4)}`;
   const comment = {
@@ -4221,44 +4228,31 @@ async function handleGetComments(request, env) {
   const viewerUsername = await getUserFromToken(request, env);
   if (!viewerUsername) return json({ error: "ابتدا وارد شو" }, 401);
 
-  const res = await env.D1.prepare("SELECT * FROM comments WHERE post_id = ? ORDER BY date ASC").bind(postId).all();
+  // قبلاً این تابع ۳ رفت‌وبرگشتِ پشتِ‌سرِهم به D1 می‌زد (خودِ کامنت‌ها، بعد آواتارها، بعد لایک‌ها)؛
+  // چون هر کدوم منتظرِ قبلی می‌موند (حتی اونایی که واقعاً به هم وابسته نبودن)، هر بار لود کردنِ
+  // کامنت‌ها معادلِ ۳ برابر تأخیرِ رفت‌وبرگشت به D1 بود. با یه LEFT JOIN همه‌چیز توی یه کوئری میاد.
+  const res = await env.D1.prepare(
+    `SELECT c.*, p.avatar_file_id AS avatar_file_id,
+            CASE WHEN cl.comment_id IS NOT NULL THEN 1 ELSE 0 END AS liked_by_viewer
+     FROM comments c
+     LEFT JOIN profiles p ON p.username = c.username
+     LEFT JOIN comment_likes cl ON cl.comment_id = c.id AND cl.username = ?
+     WHERE c.post_id = ?
+     ORDER BY c.date ASC`
+  ).bind(viewerUsername, postId).all();
   const comments = res.results || [];
 
   if (comments.length === 0) return json({ ok: true, comments: [] });
 
-  // آواتار نویسنده‌های این کامنت‌ها
-  const uniqueUsernames = [...new Set(comments.map((c) => c.username))];
-  const avatarMap = {};
-  if (uniqueUsernames.length > 0) {
-    const placeholders = uniqueUsernames.map(() => "?").join(",");
-    const profileRows = await bind(
-      env.D1.prepare(`SELECT username, avatar_file_id FROM profiles WHERE username IN (${placeholders})`),
-      uniqueUsernames
-    ).all();
-    for (const row of profileRows.results || []) {
-      if (row.avatar_file_id) avatarMap[row.username] = row.avatar_file_id;
-    }
-  }
-
-  // اینکه کاربرِ درخواست‌دهنده کدوم کامنت‌ها رو لایک کرده
-  let likedSet = new Set();
-  if (viewerUsername) {
-    const ids = comments.map((c) => c.id);
-    const placeholders = ids.map(() => "?").join(",");
-    const likeRows = await bind(
-      env.D1.prepare(`SELECT comment_id FROM comment_likes WHERE username = ? AND comment_id IN (${placeholders})`),
-      [viewerUsername, ...ids]
-    ).all();
-    likedSet = new Set((likeRows.results || []).map((r) => r.comment_id));
-  }
-
-  const enriched = comments.map((c) => ({
-    ...c,
-    avatar_file_id: avatarMap[c.username] || null,
-    likes: c.likes || 0,
-    edited: !!c.edited,
-    liked: likedSet.has(c.id),
-  }));
+  const enriched = comments.map((c) => {
+    const { liked_by_viewer, ...rest } = c;
+    return {
+      ...rest,
+      likes: c.likes || 0,
+      edited: !!c.edited,
+      liked: !!liked_by_viewer,
+    };
+  });
 
   return json({ ok: true, comments: enriched });
 }
@@ -7561,6 +7555,7 @@ async function notifyChatMembersOfNewMessage(env, conv, conversationId, senderUs
 
   const preview =
     msgType === "text" ? text : msgType === "image" ? "یه عکس فرستاد" : msgType === "video" ? "یه فیلم فرستاد" : msgType === "audio" ? "یه پیامِ صوتی فرستاد" : msgType === "file" ? "یه فایل فرستاد" : msgType === "post_shortcut" ? `یه پست فرستاد: ${text || ""}` : "یه استیکر فرستاد";
+  const pushPromises = [];
   for (const row of members.results || []) {
     if (now - (row.last_active_at || 0) < PRESENCE_WINDOW_MS) continue;
     const isMentioned = mentionedUsernames.has(row.username);
@@ -7578,14 +7573,16 @@ async function notifyChatMembersOfNewMessage(env, conv, conversationId, senderUs
           url: `${SITE_ORIGIN}/index.html?chat=${conversationId}`,
           tag: `chat-${conversationId}`,
         };
-    await Promise.all([
-      sendPushToUser(env, row.username, chatPushPayload),
-      sendFcmToUser(env, row.username, chatPushPayload),
-    ]);
+    // قبلاً پوشِ هر عضو با await داخلِ همین حلقه سری اجرا می‌شد (یعنی برای یه گروهِ ۱۰ نفره،
+    // ۱۰ بار پشتِ‌سرِهم صبر می‌کرد)؛ الان همه‌شون موازی جمع می‌شن و یه‌جا با Promise.all اجرا می‌شن.
+    pushPromises.push(
+      Promise.all([sendPushToUser(env, row.username, chatPushPayload), sendFcmToUser(env, row.username, chatPushPayload)])
+    );
   }
+  await Promise.all(pushPromises);
 }
 
-async function handleChatSend(request, env) {
+async function handleChatSend(request, env, ctx) {
   const username = await getUserFromToken(request, env);
   if (!username) return json({ error: "ابتدا وارد شو" }, 401);
   if (!(await checkRateLimit(env, "chat_send", username, 30, 60))) {
@@ -7596,24 +7593,32 @@ async function handleChatSend(request, env) {
   const conversationId = (body.conversationId || "").toString();
   if (!conversationId) return json({ error: "شناسه‌ی گفتگو لازمه" }, 400);
 
-  const conv = await env.D1.prepare("SELECT type FROM chat_conversations WHERE id = ?").bind(conversationId).first();
-  if (!conv) return json({ error: "گفتگو پیدا نشد" }, 404);
-
-  const member = await env.D1.prepare(
-    "SELECT 1 AS ok FROM chat_conversation_members WHERE conversation_id = ? AND username = ?"
-  ).bind(conversationId, username).first();
-  if (!member) return json({ error: "عضو این گفتگو نیستی" }, 403);
+  // قبلاً این بخش تا ۴ کوئریِ سری می‌زد (خودِ گفتگو، عضویت، طرفِ مقابل، وضعیتِ بلاک). دو تای اول
+  // و دوتای دوم هرکدوم با یه JOIN/ساب‌کوئری به یکی تبدیل شدن.
+  const convAndMembership = await env.D1.prepare(
+    `SELECT c.type AS conv_type, cm.username AS member_username
+     FROM chat_conversations c
+     LEFT JOIN chat_conversation_members cm ON cm.conversation_id = c.id AND cm.username = ?
+     WHERE c.id = ?`
+  ).bind(username, conversationId).first();
+  if (!convAndMembership) return json({ error: "گفتگو پیدا نشد" }, 404);
+  if (!convAndMembership.member_username) return json({ error: "عضو این گفتگو نیستی" }, 403);
+  const conv = { type: convAndMembership.conv_type };
 
   // مسدودسازی فقط برای گفتگوهای دونفره معنی داره؛ اگه هرکدوم از دو طرف اون‌یکی رو مسدود کرده باشه، ارسال ممنوعه
   if (conv.type === "direct") {
-    const other = await env.D1.prepare(
-      "SELECT username FROM chat_conversation_members WHERE conversation_id = ? AND username != ?"
-    ).bind(conversationId, username).first();
-    if (other) {
-      const blocked = await env.D1.prepare(
-        "SELECT 1 AS ok FROM chat_blocks WHERE (blocker_username = ? AND blocked_username = ?) OR (blocker_username = ? AND blocked_username = ?)"
-      ).bind(username, other.username, other.username, username).first();
-      if (blocked) return json({ error: "ارسال پیام به این گفتگو امکان‌پذیر نیست" }, 403);
+    const otherAndBlock = await env.D1.prepare(
+      `SELECT cm2.username AS other_username,
+              EXISTS(
+                SELECT 1 FROM chat_blocks
+                WHERE (blocker_username = ? AND blocked_username = cm2.username)
+                   OR (blocker_username = cm2.username AND blocked_username = ?)
+              ) AS is_blocked
+       FROM chat_conversation_members cm2
+       WHERE cm2.conversation_id = ? AND cm2.username != ?`
+    ).bind(username, username, conversationId, username).first();
+    if (otherAndBlock && otherAndBlock.is_blocked) {
+      return json({ error: "ارسال پیام به این گفتگو امکان‌پذیر نیست" }, 403);
     }
   }
 
@@ -7705,10 +7710,18 @@ async function handleChatSend(request, env) {
   // best-effort‌ه: نبودِ این متغیر یا خطای شبکه نباید جلوی ارسال خودِ پیام رو بگیره
   if (env.CHAT_LOG_CHAT_ID) {
     const logText = msgType === "text" ? text : msgType === "image" ? "[عکس]" : msgType === "video" ? "[فیلم]" : msgType === "audio" ? "[پیامِ صوتی]" : msgType === "file" ? `[فایل: ${fileName || ""}]` : msgType === "post_shortcut" ? `[پست: ${text || ""}]` : "[استیکر]";
-    sendTelegramTextTo(env, env.CHAT_LOG_CHAT_ID, `#گفتگو_${conversationId}\n${username}: ${logText}`).catch(() => {});
+    const logPromise = sendTelegramTextTo(env, env.CHAT_LOG_CHAT_ID, `#گفتگو_${conversationId}\n${username}: ${logText}`).catch(() => {});
+    if (ctx) ctx.waitUntil(logPromise);
   }
 
-  await notifyChatMembersOfNewMessage(env, conv, conversationId, username, msgType, text, now);
+  // قبلاً این خط با await اجرا می‌شد؛ یعنی فرستنده‌ی پیام تا وقتی پوش‌نوتیفیکیشنِ *همه‌ی* اعضای
+  // گفتگو (که خودش fetch به سرورهای FCM/Web Push خارجیه) کامل تموم نمی‌شد، اصلاً جوابِ «پیام ارسال
+  // شد» رو نمی‌گرفت — تو گروه‌های چندنفره این می‌تونست کاملاً محسوس باشه. چون فرستنده به نتیجه‌ی
+  // پوش کاری نداره، با ctx.waitUntil می‌بریمش پس‌زمینه؛ پیام همون لحظه‌ای که تو D1 ذخیره شد به
+  // فرستنده برمی‌گرده و پوش‌ها جدا و موازی براش می‌رن.
+  const notifyPromise = notifyChatMembersOfNewMessage(env, conv, conversationId, username, msgType, text, now).catch(() => {});
+  if (ctx) ctx.waitUntil(notifyPromise);
+  else await notifyPromise;
 
   return json({
     message: {
@@ -9276,7 +9289,7 @@ async function routeRequest(url, request, env, ctx) {
         return await handleChatContent(request, env);
       }
       if (url.pathname === "/api/chat/send" && request.method === "POST") {
-        return await handleChatSend(request, env);
+        return await handleChatSend(request, env, ctx);
       }
       if (url.pathname === "/api/chat/read" && request.method === "POST") {
         return await handleChatRead(request, env);
