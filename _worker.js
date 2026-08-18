@@ -3366,6 +3366,109 @@ async function handleRadioJingleFile(name, request, env, ctx) {
 
 // #endregion
 // #region مدیای تلگرام (عکس/ویدیو/صدای پست‌ها و پیام‌ها) — پروکسی و کش‌شده روی خودِ ورکر
+
+// پسوندهایی که فایل‌مسیرِ تلگرام برای فایل‌هایِ صوتی می‌ده (music/voice/...)؛ برایِ این‌ها از استراتژیِ
+// «کلِ فایل رو با چند تیکه‌ی موازی بگیر، کش کن، بعد هر Range رو از رویِ همون کش بِبُر» استفاده می‌کنیم
+const AUDIO_FILE_EXT_REGEX = /\.(mp3|m4a|aac|ogg|oga|opus|flac|wav|wma)$/i;
+
+// فایل‌هایِ کوچیک‌تر از این، موازی‌سازی صرفه نداره (overhead بازکردنِ چند اتصالِ جدا از سودش بیشتره)؛
+// فقط فایل‌هایِ بزرگ‌تر با چند تیکه‌ی هم‌زمان گرفته می‌شن
+const PARALLEL_FETCH_MIN_SIZE = 700 * 1024;
+// حداکثر تعداد تیکه‌های هم‌زمان؛ هر تیکه تقریباً ۱ مگابایته (عددِ کمتر برای فایل‌هایِ کوچیک‌تر خودکار انتخاب می‌شه)
+const PARALLEL_FETCH_MAX_CHUNKS = 8;
+const PARALLEL_FETCH_CHUNK_TARGET = 1024 * 1024;
+
+// کلِ یه فایل رو از سرورِ فایلِ تلگرام می‌گیره. اگه اندازه‌ی فایل از قبل معلوم باشه (از فیلدِ
+// file_size که خودِ getFile برمی‌گردونه) و فایل به‌قدرِ کافی بزرگ باشه، به‌جایِ یه رفت‌وبرگشتِ سریالِ
+// طولانی، فایل رو به چند تیکه تقسیم می‌کنه و همه‌ی تیکه‌ها رو هم‌زمان (Promise.all) با هدرِ Range
+// می‌گیره — چون سرورِ فایلِ تلگرام رویِ هر اتصال یه سقفِ توانِ عملیاتیِ نسبتاً پایین داره، باز کردنِ
+// چند اتصالِ موازی می‌تونه سرعتِ مؤثرِ کلی رو چندبرابر کنه. اگه هرکدوم از تیکه‌ها شکست بخوره، به یه
+// دانلودِ سریالِ کاملِ ساده برمی‌گرده (امن‌تر، فقط کندتر) تا پخش هیچ‌وقت کلاً fail نشه
+async function fetchTelegramFileFast(mediaBotToken, filePath, fileSize) {
+  const singleFetch = async () => {
+    const res = await fetch(`https://api.telegram.org/file/bot${mediaBotToken}/${filePath}`);
+    if (!res.ok) return null;
+    const buf = await res.arrayBuffer();
+    return { buf, contentType: res.headers.get("Content-Type") };
+  };
+
+  if (!fileSize || fileSize < PARALLEL_FETCH_MIN_SIZE) return singleFetch();
+
+  const chunkCount = Math.max(2, Math.min(PARALLEL_FETCH_MAX_CHUNKS, Math.round(fileSize / PARALLEL_FETCH_CHUNK_TARGET)));
+  const chunkSize = Math.ceil(fileSize / chunkCount);
+  const ranges = [];
+  for (let start = 0; start < fileSize; start += chunkSize) {
+    ranges.push([start, Math.min(fileSize - 1, start + chunkSize - 1)]);
+  }
+
+  try {
+    let contentType = null;
+    const parts = await Promise.all(
+      ranges.map(([start, end]) =>
+        fetch(`https://api.telegram.org/file/bot${mediaBotToken}/${filePath}`, { headers: { Range: `bytes=${start}-${end}` } })
+          .then(async (r) => {
+            if (!r.ok) throw new Error(`تیکه‌ی ${start}-${end} شکست خورد`);
+            if (!contentType) contentType = r.headers.get("Content-Type");
+            return r.arrayBuffer();
+          })
+      )
+    );
+    const total = parts.reduce((sum, p) => sum + p.byteLength, 0);
+    const combined = new Uint8Array(total);
+    let offset = 0;
+    for (const p of parts) {
+      combined.set(new Uint8Array(p), offset);
+      offset += p.byteLength;
+    }
+    return { buf: combined.buffer, contentType };
+  } catch (e) {
+    return singleFetch();
+  }
+}
+
+// هدرِ Range رو پارس می‌کنه و بازه‌ی [start, end] (شاملِ هر دو سر) رو نسبت‌به یه فایل به اندازه‌ی
+// size برمی‌گردونه؛ اگه نامعتبر/غیرقابل‌ارضا بود null برمی‌گردونه
+function parseByteRange(rangeHeader, size) {
+  const m = /^bytes=(\d*)-(\d*)$/.exec((rangeHeader || "").trim());
+  if (!m || !size) return null;
+  const [, startStr, endStr] = m;
+  if (startStr === "" && endStr === "") return null;
+  let start, end;
+  if (startStr === "") {
+    // «بازه‌ی پسوندی»: N بایتِ آخرِ فایل (مثلِ bytes=-500)
+    const suffixLength = parseInt(endStr, 10);
+    if (!Number.isFinite(suffixLength) || suffixLength <= 0) return null;
+    start = Math.max(0, size - suffixLength);
+    end = size - 1;
+  } else {
+    start = parseInt(startStr, 10);
+    end = endStr === "" ? size - 1 : parseInt(endStr, 10);
+  }
+  if (!Number.isFinite(start) || !Number.isFinite(end) || start > end || start < 0 || start >= size) return null;
+  if (end >= size) end = size - 1;
+  return { start, end };
+}
+
+// از رویِ یه Response کاملِ کش‌شده (که کلِ فایل رو داره)، فقط بازه‌ی خواسته‌شده رو (۲۰۶) برمی‌گردونه —
+// بدونِ این‌که دوباره چیزی از تلگرام بگیریم. این دقیقاً همون چیزیه که پخش/سیکِ آهنگ رو سریع می‌کنه:
+// همیشه از رویِ کشِ edge کلادفلر جواب می‌دیم، نه یه رفت‌وبرگشتِ تازه به سرورِ کندِ فایلِ تلگرام
+async function sliceCachedMediaResponse(cachedResponse, rangeHeader) {
+  const buf = await cachedResponse.arrayBuffer();
+  const size = buf.byteLength;
+  const range = parseByteRange(rangeHeader, size);
+  if (!range) {
+    // بازه‌ی غیرقابل‌ارضا (مثلاً سیک به جایی بعدِ پایانِ فایل)؛ طبقِ استانداردِ HTTP جواب ۴۱۶ می‌دیم
+    return new Response(null, { status: 416, headers: { "Content-Range": `bytes */${size}` } });
+  }
+  const { start, end } = range;
+  const chunk = buf.slice(start, end + 1);
+  const headers = new Headers(cachedResponse.headers);
+  headers.set("Content-Range", `bytes ${start}-${end}/${size}`);
+  headers.set("Content-Length", String(chunk.byteLength));
+  headers.set("Accept-Ranges", "bytes");
+  return new Response(chunk, { status: 206, headers });
+}
+
 async function handleMedia(fileId, env, request, ctx) {
   if (!fileId) return json({ error: "شناسه فایل لازمه" }, 400);
 
@@ -3385,37 +3488,102 @@ async function handleMedia(fileId, env, request, ctx) {
   // و مرورگر مجبور نشه (چون جواب کامل ۲۰۰ گرفته، نه ۲۰۶ بخشی) دوباره از صفر شروع کنه
   const rangeHeader = request ? request.headers.get("Range") : null;
 
-  // کش روی edge کلادفلر: فقط برای درخواست‌های کامل (بدون Range)، تا فایل‌های پرتکرار
-  // (مثل عکس یه پست پرطرفدار) دیگه به ازای هر کاربر دوباره از تلگرام گرفته نشن.
-  // درخواست‌های Range (برای سیک کردن داخل پخش صدا/ویدیو) از این کش رد می‌شن و همیشه مستقیم می‌رن سراغ تلگرام،
-  // چون کش کردن یه تکه‌ی وسط فایل به‌جای کل فایل می‌تونه پخش رو خراب کنه.
+  // کش روی edge کلادفلر: قبلاً این کش فقط برایِ درخواست‌هایِ کامل (بدونِ Range) چک می‌شد و هر
+  // درخواستِ Range همیشه مستقیم می‌رفت سراغِ تلگرام — ولی تگِ <audio> تویِ اکثرِ مرورگرها از همون
+  // اولین درخواست هم هدرِ Range می‌فرسته (نه فقط موقعِ سیک‌کردن)، پس عملاً پخشِ آهنگ هیچ‌وقت از این
+  // کش استفاده نمی‌کرد و هر بار (حتی برایِ آهنگیِ که صدبار پخش شده) دوباره از سرورِ کندِ فایلِ تلگرام
+  // می‌گرفت. حالا اول همیشه (چه Range باشه چه نه) این کش رو چک می‌کنیم؛ اگه فایل کامل قبلاً کش شده
+  // باشه، بازه‌ی خواسته‌شده رو مستقیماً از رویِ همون کش (نه تلگرام) می‌بُریم و برمی‌گردونیم.
   const cache = caches.default;
   const cacheKey = new Request(`https://media-cache.internal/${encodeURIComponent(fileId)}`, { method: "GET" });
 
-  if (!rangeHeader) {
-    const cached = await cache.match(cacheKey);
-    if (cached) return cached;
+  const cached = await cache.match(cacheKey);
+  if (cached) {
+    if (rangeHeader) return sliceCachedMediaResponse(cached, rangeHeader);
+    return cached;
   }
 
+  // اطلاعاتِ فایل (مسیر + اندازه) رو کش می‌کنیم؛ اندازه لازمه تا بشه فایل‌هایِ بزرگ رو موازی گرفت
+  // بدونِ این‌که مجبور باشیم هر بار یه درخواستِ جداگانه فقط برایِ فهمیدنِ اندازه بزنیم
   const infoCacheKey = new Request(`https://media-filepath-cache.internal/${encodeURIComponent(fileId)}`, { method: "GET" });
   let filePath = null;
+  let fileSize = null;
   const cachedInfo = await cache.match(infoCacheKey);
   if (cachedInfo) {
-    filePath = await cachedInfo.text();
-  } else {
+    try {
+      const parsed = JSON.parse(await cachedInfo.text());
+      filePath = parsed.path;
+      fileSize = parsed.size || null;
+    } catch (e) {
+      filePath = null;
+    }
+  }
+  if (!filePath) {
     const infoRes = await fetch(`https://api.telegram.org/bot${mediaBotToken}/getFile?file_id=${rawFileId}`);
     const info = await infoRes.json();
     if (!info.ok) return json({ error: "فایل پیدا نشد" }, 404);
     filePath = info.result.file_path;
+    fileSize = info.result.file_size || null;
     // این مسیر برای این fileId عملاً ثابته؛ کش‌کردنش یعنی دفعاتِ بعدی (چه یه کاربرِ دیگه، چه
     // همین کاربر موقعِ سیک‌کردنِ صدا/ویدیو با درخواست‌های Range پی‌درپی) این رفت‌وبرگشتِ اول حذف بشه
     if (ctx) {
       ctx.waitUntil(
-        cache.put(infoCacheKey, new Response(filePath, { headers: { "Cache-Control": "public, max-age=21600" } }))
+        cache.put(
+          infoCacheKey,
+          new Response(JSON.stringify({ path: filePath, size: fileSize }), { headers: { "Cache-Control": "public, max-age=21600" } })
+        )
       );
     }
   }
 
+  const isAudioFile = AUDIO_FILE_EXT_REGEX.test(filePath || "");
+
+  if (isAudioFile) {
+    // برایِ فایل‌هایِ صوتی، کلِ فایل رو (با چند تیکه‌ی موازی اگه به‌قدرِ کافی بزرگ بود — نگاهِ بالا،
+    // fetchTelegramFileFast) یه‌جا می‌گیریم، کاملش رو کش می‌کنیم، و همون بازه‌ای که مرورگر خواسته رو
+    // از رویِ همین جوابِ تازه می‌بُریم. این‌جوری اولین پخشِ هر آهنگ چندبرابر سریع‌تر از قبله (چند
+    // اتصالِ هم‌زمان به‌جایِ یه اتصالِ سریالِ کند)، و هر پخش/سیکِ بعدی (همین کاربر یا کاربرهایِ
+    // دیگه) کلاً از edge کشِ کلادفلر میاد، بدونِ هیچ تماسی با تلگرام
+    let result = await fetchTelegramFileFast(mediaBotToken, filePath, fileSize);
+
+    // اگه شکست خورد، شاید مسیرِ کش‌شده منقضی/نامعتبر شده بوده؛ یه‌بار با اطلاعاتِ تازه دوباره تلاش کن
+    if (!result && cachedInfo) {
+      const freshInfoRes = await fetch(`https://api.telegram.org/bot${mediaBotToken}/getFile?file_id=${rawFileId}`);
+      const freshInfo = await freshInfoRes.json();
+      if (freshInfo.ok) {
+        filePath = freshInfo.result.file_path;
+        fileSize = freshInfo.result.file_size || null;
+        result = await fetchTelegramFileFast(mediaBotToken, filePath, fileSize);
+        if (ctx && result) {
+          ctx.waitUntil(
+            cache.put(
+              infoCacheKey,
+              new Response(JSON.stringify({ path: filePath, size: fileSize }), { headers: { "Cache-Control": "public, max-age=21600" } })
+            )
+          );
+        }
+      }
+    }
+    if (!result) return json({ error: "فایل پیدا نشد" }, 404);
+
+    const headers = new Headers();
+    headers.set("Content-Type", result.contentType || "application/octet-stream");
+    headers.set("X-Content-Type-Options", "nosniff");
+    headers.set("Cache-Control", "public, max-age=86400");
+    headers.set("Accept-Ranges", "bytes");
+    headers.set("Content-Length", String(result.buf.byteLength));
+
+    const fullResponse = new Response(result.buf, { status: 200, headers });
+    // یه نسخه‌ی کامل رو (بدونِ توجه به این‌که خودِ همین درخواست Range داشته یا نه) کش می‌کنیم، تا
+    // پخش/سیکِ بعدی از رویِ همین کش سرو بشه؛ نسخه‌ی دیگه رو یا مستقیم برمی‌گردونیم یا ازش می‌بُریم
+    if (ctx) ctx.waitUntil(cache.put(cacheKey, fullResponse.clone()));
+
+    if (rangeHeader) return sliceCachedMediaResponse(fullResponse.clone(), rangeHeader);
+    return fullResponse;
+  }
+
+  // فایل‌هایِ غیرصوتی (عکس/ویدیو/سند و...): همون رفتارِ قبلی — بازه‌ی خواسته‌شده رو عیناً از تلگرام
+  // می‌خوایم (نه کلِ فایل، چون ویدیوها می‌تونن خیلی بزرگ باشن و بافرکردنِ کاملشون تویِ ورکر صرفه نداره)
   const telegramReqHeaders = {};
   if (rangeHeader) telegramReqHeaders["Range"] = rangeHeader;
 
@@ -3430,13 +3598,17 @@ async function handleMedia(fileId, env, request, ctx) {
     const freshInfo = await freshInfoRes.json();
     if (freshInfo.ok) {
       filePath = freshInfo.result.file_path;
+      fileSize = freshInfo.result.file_size || null;
       fileRes = await fetch(
         `https://api.telegram.org/file/bot${mediaBotToken}/${filePath}`,
         { headers: telegramReqHeaders }
       );
       if (ctx && fileRes.ok) {
         ctx.waitUntil(
-          cache.put(infoCacheKey, new Response(filePath, { headers: { "Cache-Control": "public, max-age=21600" } }))
+          cache.put(
+            infoCacheKey,
+            new Response(JSON.stringify({ path: filePath, size: fileSize }), { headers: { "Cache-Control": "public, max-age=21600" } })
+          )
         );
       }
     }
