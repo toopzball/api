@@ -5988,6 +5988,107 @@ async function handleAdminGetChangelog(request, env) {
 }
 
 // #endregion
+// #region OTA وب اپِ اندروید — تاییدِ دستیِ آپدیت توسطِ مالک/ادمینِ رتبه‌ی ۵ قبل از رسیدن به کاربرا
+// جریان: پروکسیِ Pages (سایتِ زنده) هشِ SHA-256ِ فایل‌های OTA رو از رویِ آخرین دیپلوی حساب می‌کنه
+// («نسخه‌ی زنده»)؛ این ورکر اون هش‌ها رو با نسخه‌ای که قبلاً تایید شده مقایسه می‌کنه؛ فقط بعدِ
+// این‌که مالک/ادمینِ رتبه‌ی ۵ صریحاً تاییدش کنه، همون نسخه تویِ kv_store به‌عنوانِ «تاییدشده»
+// ذخیره می‌شه. اپِ اندروید هیچ‌وقت مستقیم به سایت وصل نمی‌شه؛ فقط از GET /api/app-version (پایین‌تر
+// همین بخش) می‌پرسه، که همیشه فقط همون نسخه‌ی تاییدشده رو برمی‌گردونه — یعنی هر دیپلویِ جدید،
+// خودکار به دستِ کاربرا نمی‌رسه تا کسی دستی تاییدش نکنه.
+const OTA_APPROVED_KV_KEY = "ota:approved";
+const OTA_APPROVED_KV_TTL_SECONDS = 315360000; // ~۱۰ سال؛ عملاً دائمیه تا تاییدِ بعدی جایگزینش کنه
+
+// آدرسِ سایتِ زنده که پروکسیِ Pages (همون که هشِ فایل‌ها رو حساب می‌کنه) روش دیپلوی شده. اگه دامنه
+// عوض شد، این مقدار (یا env.OTA_SITE_ORIGIN اگه ست شده باشه) باید آپدیت بشه.
+const OTA_SITE_ORIGIN = "https://dehot.bbboi.ir";
+
+// از پروکسیِ Pages می‌خواد آخرین هشِ «زنده»ی فایل‌های OTA رو (بدونِ توجه به این‌که تایید شده یا نه)
+// حساب کنه و برگردونه؛ با همون X-Internal-Key که برای بقیه‌ی ارتباطاتِ بینِ ورکرها استفاده می‌شه.
+async function fetchOtaLiveHashes(env) {
+  const origin = env.OTA_SITE_ORIGIN || OTA_SITE_ORIGIN;
+  const res = await fetch(`${origin}/api/internal/ota/live-hashes`, {
+    headers: { "X-Internal-Key": env.INTERNAL_KEY || "" },
+  });
+  if (!res.ok) throw new Error(`سایت با استاتوسِ ${res.status} جواب داد`);
+  const data = await res.json();
+  if (data.error) throw new Error(data.error);
+  return data; // { version, files }
+}
+
+async function getApprovedOtaRelease(env) {
+  const raw = await kvGet(env, OTA_APPROVED_KV_KEY);
+  if (!raw) return { version: "bundled", files: {}, approved_by: null, approved_at: null };
+  try {
+    return JSON.parse(raw);
+  } catch (e) {
+    return { version: "bundled", files: {}, approved_by: null, approved_at: null };
+  }
+}
+
+// اندپوینتِ عمومی که اپِ اندروید صداش می‌زنه (بدونِ نیاز به لاگین؛ خودِ اپه که چک می‌کنه، نه یه
+// کاربرِ خاص). همیشه فقط آخرین نسخه‌ی تاییدشده رو برمی‌گردونه، نه لزوماً آخرین دیپلوی.
+async function handleAppVersion(request, env) {
+  const approved = await getApprovedOtaRelease(env);
+  return json({ version: approved.version, files: approved.files });
+}
+
+// فقط مالک/ادمینِ رتبه‌ی ۵: نسخه‌ی زنده (آخرین دیپلوی) رو با نسخه‌ی تاییدشده‌ی فعلی مقایسه می‌کنه
+// و لیستِ فایل‌های واقعاً تغییرکرده رو برمی‌گردونه — برای نمایش تویِ پنلِ ادمین قبل از تایید.
+async function handleAdminOtaPending(request, env) {
+  const username = await getUserFromToken(request, env);
+  if (!username) return json({ error: "ابتدا وارد شو" }, 401);
+  if (!isOwnerLevel(await getAdminRank(env, username))) return json({ error: "دسترسی نداری" }, 403);
+
+  let live;
+  try {
+    live = await fetchOtaLiveHashes(env);
+  } catch (e) {
+    return json({ error: `گرفتنِ نسخه‌ی زنده از سایت شکست خورد: ${e.message}` }, 502);
+  }
+  const approved = await getApprovedOtaRelease(env);
+
+  const changedFiles = Object.keys(live.files || {}).filter(
+    (name) => live.files[name] !== (approved.files || {})[name]
+  );
+
+  return json({
+    live_version: live.version,
+    approved_version: approved.version,
+    approved_by: approved.approved_by,
+    approved_at: approved.approved_at,
+    has_pending_update: live.version !== approved.version,
+    changed_files: changedFiles,
+  });
+}
+
+// فقط مالک/ادمینِ رتبه‌ی ۵: نسخه‌ی زنده رو (دوباره، تازه، برای جلوگیری از رِیس با یه دیپلویِ
+// همزمان) می‌گیره و به‌عنوانِ نسخه‌ی تاییدشده‌ی جدید ذخیره می‌کنه — از همین لحظه، اپِ اندروید
+// این نسخه رو از /api/app-version می‌بینه و OTA رو شروع می‌کنه.
+async function handleAdminOtaApprove(request, env) {
+  const username = await getUserFromToken(request, env);
+  if (!username) return json({ error: "ابتدا وارد شو" }, 401);
+  if (!isOwnerLevel(await getAdminRank(env, username))) return json({ error: "دسترسی نداری" }, 403);
+
+  let live;
+  try {
+    live = await fetchOtaLiveHashes(env);
+  } catch (e) {
+    return json({ error: `گرفتنِ نسخه‌ی زنده از سایت شکست خورد: ${e.message}` }, 502);
+  }
+
+  const release = {
+    version: live.version,
+    files: live.files,
+    approved_by: username,
+    approved_at: Date.now(),
+  };
+  await kvPut(env, OTA_APPROVED_KV_KEY, JSON.stringify(release), OTA_APPROVED_KV_TTL_SECONDS);
+
+  return json({ ok: true, ...release });
+}
+// #endregion
+
+// #endregion
 // #region سوییچِ HTTP/3 دامنه (فقط مالک سایت) — از طریق API خودِ کلادفلر
 // ---------- سوییچِ HTTP/3 دامنه (فقط مالک سایت) ----------
 // این مربوط به تنظیماتِ Zone تو کلادفلره، نه چیزی که این ورکر مستقیم کنترلش کنه؛ برای همین باید
@@ -9492,6 +9593,15 @@ async function routeRequest(url, request, env, ctx) {
       }
       if (url.pathname === "/api/admin/changelog/current" && request.method === "GET") {
         return await handleAdminGetChangelog(request, env);
+      }
+      if (url.pathname === "/api/app-version" && request.method === "GET") {
+        return await handleAppVersion(request, env);
+      }
+      if (url.pathname === "/api/admin/ota/pending" && request.method === "GET") {
+        return await handleAdminOtaPending(request, env);
+      }
+      if (url.pathname === "/api/admin/ota/approve" && request.method === "POST") {
+        return await handleAdminOtaApprove(request, env);
       }
       if (url.pathname === "/api/admin/cloudflare/http3" && request.method === "GET") {
         return await handleAdminGetHttp3(request, env);
