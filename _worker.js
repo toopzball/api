@@ -1032,6 +1032,67 @@ async function handleLogout(request, env) {
 // که می‌تونستن با جاسازی نام کاربری داخل onclick سمت فرانت، باعث اجرای کد دلخواه (XSS ذخیره‌شده) بشن
 const USERNAME_RE = /^[\p{L}\p{N}_]{3,20}$/u;
 
+// ---------- یکی‌سازیِ یوزرنیمِ فارسی (رفعِ باگِ «حساب هست ولی لاگین رد می‌شه») ----------
+// خیلی از کیبوردهای فارسی/عربی (بسته به گوشی، اپ، یا حتی زبانِ دومِ فعال) به‌جایِ «ی»/«ک» فارسی،
+// معادلِ عربیِ «ي»/«ك» رو تایپ می‌کنن؛ روی صفحه‌کلید کاملاً یکی به‌نظر میان، ولی از نظرِ کدِ یونیکد دو
+// کاراکترِ متفاوتن. تا قبل از این، ثبت‌نام و لاگین با مقایسه‌ی رشته‌ای دقیق (===) انجام می‌شد؛ یعنی
+// اگه کسی با گوشی/کیبوردِ الف ثبت‌نام می‌کرد و بعداً از گوشی/کیبوردِ ب (که نسخه‌ی عربیِ همون حرف رو
+// می‌فرسته) لاگین می‌زد، دقیقاً همون یوزرنیمی که خودش ساخته رو تایپ کرده بود ولی سرور می‌گفت «نام
+// کاربری یا رمز اشتباهه» — چون بایت‌به‌بایت با چیزی که تو دیتابیس ذخیره شده فرق داشت. همینطور برایِ
+// رقم‌ها: کیبوردهای مختلف ممکنه رقمِ فارسی (۱۲۳)، عربی (١٢٣) یا انگلیسی (123) بفرستن.
+// این تابع همه‌ی این حالت‌ها رو به یه شکلِ استاندارد (یِ فارسی + کِ فارسی + رقمِ انگلیسی) تبدیل می‌کنه؛
+// همه‌جا (ثبت‌نام، تغییرِ یوزرنیم، چکِ در‌دسترس‌بودن، و لاگین) قبل از هر مقایسه‌ای صدا زده می‌شه.
+function normalizeUsername(raw) {
+  if (!raw) return "";
+  let s = raw.toString().trim().normalize("NFC");
+  // کاراکترهای صفر-عرض/فرمتی (نیم‌فاصله ZWNJ، ZWJ، BOM و جهت‌دهنده‌های RTL/LTR) که کیبوردهای
+  // فارسی گاهی وسطِ متن جا می‌ذارن، ولی هیچ‌جا دیده نمی‌شن؛ اگه حذف نشن، همین‌ها هم می‌تونن باعثِ
+  // شکستِ مقایسه‌ی دقیق بشن حتی وقتی یوزرنیم ظاهراً کاملاً درسته.
+  s = s.replace(/[\u200B-\u200F\u202A-\u202E\uFEFF]/g, "");
+  // ي / ى (عربی) -> ی (فارسی)، ك (عربی) -> ک (فارسی)
+  s = s.replace(/[\u064A\u0649]/g, "\u06CC").replace(/\u0643/g, "\u06A9");
+  // رقمِ فارسی/عربی -> انگلیسی
+  const DIGIT_MAP = {
+    "۰": "0", "۱": "1", "۲": "2", "۳": "3", "۴": "4", "۵": "5", "۶": "6", "۷": "7", "۸": "8", "۹": "9",
+    "٠": "0", "١": "1", "٢": "2", "٣": "3", "٤": "4", "٥": "5", "٦": "6", "٧": "7", "٨": "8", "٩": "9",
+  };
+  s = s.replace(/[۰-۹٠-٩]/g, (d) => DIGIT_MAP[d] || d);
+  return s;
+}
+
+// جدولِ همه‌ی جاهایی که یوزرنیم به‌عنوانِ کلید ذخیره شده؛ هم موقعِ تغییرِ دستیِ یوزرنیم (handleChangeUsername)
+// و هم موقعِ خودتصحیحیِ خودکارِ لاگین (selfHealUsernameIfNeeded) لازمه.
+const USERNAME_KEYED_TABLES = [
+  ["users", "username"],
+  ["sessions", "username"],
+  ["profiles", "username"],
+  ["posts", "username"],
+  ["comments", "username"],
+  ["comment_likes", "username"],
+  ["votes", "username"],
+  ["likes", "username"],
+  ["stickers", "username"],
+  ["notifications", "to_username"],
+  ["notifications", "from_username"],
+  ["notif_read", "username"],
+  ["reports", "reporter_username"],
+  ["reports", "target_username"],
+  ["chat_conversation_members", "username"],
+  ["chat_messages", "sender_username"],
+  ["chat_blocks", "blocker_username"],
+  ["chat_blocks", "blocked_username"],
+  ["chat_conversations", "created_by"],
+  ["push_subscriptions", "username"],
+  ["user_presence", "username"],
+];
+
+async function renameUsernameEverywhere(env, oldUsername, newUsername) {
+  const statements = USERNAME_KEYED_TABLES.map(([table, col]) =>
+    env.D1.prepare(`UPDATE ${table} SET ${col} = ? WHERE ${col} = ?`).bind(newUsername, oldUsername)
+  );
+  await env.D1.batch(statements);
+}
+
 // #endregion
 // #region صدور چالشِ کپچا (اثبات‌کار) برای فرم‌های ورود/ثبت‌نام
 // ---------- صدور چالشِ کپچا (اثبات‌کار) برای فرم‌های ورود/ثبت‌نام ----------
@@ -1054,7 +1115,9 @@ async function handleRegister(request, env) {
     return json({ error: "تعداد ثبت‌نام از این آی‌پی زیاد بوده، یه ساعت دیگه امتحان کن" }, 429);
   }
 
-  const { username, password, captchaSolution, referralCode } = await request.json();
+  const body = await request.json();
+  const username = normalizeUsername(body.username);
+  const { password, captchaSolution, referralCode } = body;
 
   if (!isTrustedNativeApp(request, env) && !(await verifyCaptchaSolution(captchaSolution, env))) {
     return json({ error: "تایید امنیتی انجام نشد؛ صفحه رو رفرش کن و دوباره امتحان کن" }, 400);
@@ -1166,7 +1229,9 @@ async function handleLogin(request, env) {
     return json({ error: "تعداد تلاش‌های ورود از این آی‌پی زیاد بوده، چند دقیقه دیگه امتحان کن" }, 429);
   }
 
-  const { username, password, captchaSolution } = await request.json();
+  const body = await request.json();
+  const username = normalizeUsername(body.username);
+  const { password, captchaSolution } = body;
   if (!username || !password) return json({ error: "نام کاربری و رمز لازمه" }, 400);
 
   if (!isTrustedNativeApp(request, env) && !(await verifyCaptchaSolution(captchaSolution, env))) {
@@ -1179,7 +1244,20 @@ async function handleLogin(request, env) {
     return json({ error: "به خاطر تلاش‌های ناموفق زیاد، ۵ دقیقه صبر کن و دوباره امتحان کن" }, 429);
   }
 
-  const userData = await env.D1.prepare("SELECT * FROM users WHERE username = ?").bind(username).first();
+  let userData = await env.D1.prepare("SELECT * FROM users WHERE username = ?").bind(username).first();
+
+  // اگه با جست‌وجوی سریع (indexed) پیدا نشد: ممکنه این حساب از قبلِ اضافه‌شدنِ normalizeUsername
+  // ثبت شده و خودِ ستونِ username تو دیتابیس با حروفِ عربیِ «ي/ى/ك» (به‌جای «ی/ک» فارسی) ذخیره شده
+  // باشه. یه بارِ دیگه، این‌بار با فولدکردنِ خودِ ستون تو کوئری، دنبالش می‌گردیم. این fallback فقط
+  // وقتی اجرا می‌شه که lookup اول جواب نداده، پس رویِ سرعتِ لاگینِ حسابِ عادی اثری نداره.
+  let legacyUsername = null;
+  if (!userData) {
+    userData = await env.D1.prepare(
+      "SELECT * FROM users WHERE REPLACE(REPLACE(REPLACE(username,'ي','ی'),'ى','ی'),'ك','ک') = ?"
+    ).bind(username).first();
+    if (userData) legacyUsername = userData.username;
+  }
+
   if (!userData) {
     await registerFailedLogin(env, username);
     return json({ error: "نام کاربری یا رمز اشتباهه" }, 401);
@@ -1192,16 +1270,30 @@ async function handleLogin(request, env) {
   }
   if (userData.banned) return json({ error: "خطای دیتابیس، لطفاً بعداً دوباره امتحان کن" }, 403);
 
+  // رمز درست بود و از مسیرِ fallback پیدا شده بود: یعنی واقعاً همون حسابِ خودشه، فقط شکلِ ذخیره‌شده‌ش
+  // قدیمی/غیراستاندارد بوده. همینجا (فقط همین یه‌بار، برایِ همیشه) یوزرنیمِ حساب رو تو همه‌ی جدول‌ها
+  // به شکلِ استاندارد تبدیل می‌کنیم؛ از این به بعد لاگینش از همون lookup سریعِ اول پیدا می‌شه.
+  let finalUsername = userData.username;
+  if (legacyUsername && legacyUsername !== username) {
+    try {
+      await renameUsernameEverywhere(env, legacyUsername, username);
+      finalUsername = username;
+    } catch (err) {
+      console.error("خطای خودتصحیحیِ یوزرنیم موقعِ لاگین:", err);
+      // اگه این مرحله شکست بخوره، لاگین رو خراب نمی‌کنیم؛ فقط با همون شکلِ فعلیِ ذخیره‌شده ادامه می‌دیم
+    }
+  }
+
   await kvDelete(env, `login_fails:${username}`);
 
   const token = randomHex(24);
   // سشن به مدت ۳۰ روز معتبره
   const expiresAt = Date.now() + 30 * 24 * 60 * 60 * 1000;
   await env.D1.prepare("INSERT INTO sessions (token, username, expires_at) VALUES (?, ?, ?)")
-    .bind(token, username, expiresAt)
+    .bind(token, finalUsername, expiresAt)
     .run();
 
-  return json({ ok: true, token, username });
+  return json({ ok: true, token, username: finalUsername });
 }
 
 // #endregion
@@ -7856,7 +7948,10 @@ async function notifyChatMembersOfNewMessage(env, conv, conversationId, senderUs
   // گروهن معتبرن؛ منشن حتی اگه اون عضو نوتیفِ این گفتگو رو سایلنت کرده باشه هم می‌رسه
   const mentionedUsernames = new Set();
   if (msgType === "text" && conv.type === "group" && text) {
-    const candidateMatches = text.match(/@([a-zA-Z0-9_]{3,20})/g) || [];
+    // یوزرنیم‌ها می‌تونن فارسی هم باشن (USERNAME_RE با \p{L} هر حرفِ یونیکد رو قبول می‌کنه)، پس این
+    // ریجکسِ منشن هم باید همون کاراکترها رو بشناسه؛ قبلاً فقط a-zA-Z0-9_ بود و منشنِ یوزرنیمِ فارسی
+    // رو اصلاً پیدا نمی‌کرد (یعنی اون عضو هیچ‌وقت پوشِ منشن نمی‌گرفت)
+    const candidateMatches = text.match(/@([\p{L}\p{N}_]{3,20})/gu) || [];
     const candidates = new Set(candidateMatches.map((x) => x.slice(1)));
     for (const row of members.results || []) {
       if (candidates.has(row.username)) mentionedUsernames.add(row.username);
@@ -8840,7 +8935,7 @@ async function handleCheckUsername(request, env) {
   if (!username) return json({ error: "ابتدا وارد شو" }, 401);
 
   const url = new URL(request.url);
-  const candidate = (url.searchParams.get("username") || "").trim();
+  const candidate = normalizeUsername(url.searchParams.get("username") || "");
 
   if (!USERNAME_RE.test(candidate)) {
     return json({ available: false, reason: "نام کاربری باید ۳ تا ۲۰ کاراکتر و فقط شامل حروف، عدد و _ باشه" });
@@ -8862,7 +8957,8 @@ async function handleCheckUsername(request, env) {
 // ---------- تغییر نام کاربری ----------
 // نکته‌ی مهم: چون یوزرنیم به‌جای یه شناسه‌ی عددی، توی خیلی از جدول‌ها مستقیماً به‌عنوان کلید ذخیره شده،
 // تغییرش باید همزمان روی همه‌ی این جدول‌ها اعمال بشه، وگرنه رکوردهای قدیمی (پست، کامنت، چت و...) یتیم می‌مونن.
-// از env.D1.batch استفاده می‌کنیم که چندتا استیتمنت رو به‌صورت یکجا (اتمیک) اجرا می‌کنه.
+// از renameUsernameEverywhere استفاده می‌کنیم (همون تابعِ مشترکی که selfHealUsernameIfNeeded تو
+// لاگین هم ازش استفاده می‌کنه) که با env.D1.batch چندتا استیتمنت رو یکجا (اتمیک) اجرا می‌کنه.
 async function handleChangeUsername(request, env) {
   const username = await getUserFromToken(request, env);
   if (!username) return json({ error: "ابتدا وارد شو" }, 401);
@@ -8878,7 +8974,7 @@ async function handleChangeUsername(request, env) {
     return json({ error: "درخواست نامعتبره" }, 400);
   }
 
-  const newUsername = (body.newUsername || "").toString().trim();
+  const newUsername = normalizeUsername(body.newUsername || "");
   if (!USERNAME_RE.test(newUsername)) {
     return json({ error: "نام کاربری باید ۳ تا ۲۰ کاراکتر و فقط شامل حروف، عدد و _ باشه" }, 400);
   }
@@ -8891,35 +8987,8 @@ async function handleChangeUsername(request, env) {
     return json({ error: "این نام کاربری قبلاً گرفته شده" }, 409);
   }
 
-  const tableColumns = [
-    ["users", "username"],
-    ["sessions", "username"],
-    ["profiles", "username"],
-    ["posts", "username"],
-    ["comments", "username"],
-    ["comment_likes", "username"],
-    ["votes", "username"],
-    ["likes", "username"],
-    ["stickers", "username"],
-    ["notifications", "to_username"],
-    ["notifications", "from_username"],
-    ["notif_read", "username"],
-    ["reports", "reporter_username"],
-    ["reports", "target_username"],
-    ["chat_conversation_members", "username"],
-    ["chat_messages", "sender_username"],
-    ["chat_blocks", "blocker_username"],
-    ["chat_blocks", "blocked_username"],
-    ["chat_conversations", "created_by"],
-    ["push_subscriptions", "username"],
-    ["user_presence", "username"],
-  ];
-
   try {
-    const statements = tableColumns.map(([table, col]) =>
-      env.D1.prepare(`UPDATE ${table} SET ${col} = ? WHERE ${col} = ?`).bind(newUsername, username)
-    );
-    await env.D1.batch(statements);
+    await renameUsernameEverywhere(env, username, newUsername);
   } catch (err) {
     console.error("خطای تغییر نام کاربری:", err);
     return json({ error: "تغییر نام کاربری ناموفق بود، دوباره امتحان کن" }, 500);
