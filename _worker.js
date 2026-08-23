@@ -2994,6 +2994,20 @@ function seededShuffle(array, seed) {
 const RADIO_VOICE_PAUSE_SECONDS = 3; // مکثِ کوتاه بینِ پایانِ ویس و شروعِ آهنگِ بعدی
 const RADIO_VOICE_MAX_SECONDS = 20;
 
+// ---------- پیامِ بازرگانی: حالا یه قسمتِ واقعی تو موتورِ زمان‌بندیه (مثلِ voice/pause)، نه چیزی
+// که هر گوشی جدا و تصادفی سمتِ کلاینت پخش کنه. این‌جوری چه اسمِ فایل چه طولِ دقیقِ پخش برایِ همه‌ی
+// کاربرا یکیه و از رویِ همون startMs/offsetSeconds سرور سینک می‌شن — درست مثلِ آهنگ‌ها.
+// فایل‌ها همچنان از دامنه‌ی فرانت (پوشه‌ی ads/ کنارِ radio.html) سرو می‌شن؛ اینجا فقط اسم + طولِ
+// واقعیِ هرکدوم (با ffprobe از رویِ خودِ فایل‌ها اندازه‌گیری شده) لازمه تا موتور بتونه زمان‌بندی کنه.
+// وقتی فایلِ جدیدی به ads/list.json اضافه کردی، طولِ واقعیشو (به ثانیه، گردشده به بالا) اینجا هم اضافه کن.
+const RADIO_ADS = [
+  { name: "ad-01.mp3", durationSeconds: 31 },
+  { name: "ad-02.mp3", durationSeconds: 36 },
+  { name: "ad-03.mp3", durationSeconds: 19 },
+  { name: "ad-04.mp3", durationSeconds: 44 },
+  { name: "ad-05.mp3", durationSeconds: 37 },
+];
+
 async function getRadioTracks(env) {
   const rows = await env.D1.prepare(
     "SELECT id, username, file_id, audio_title, audio_performer, audio_thumb, duration_seconds FROM posts WHERE type = 'audio' ORDER BY id ASC"
@@ -3028,14 +3042,16 @@ async function bootstrapRadioState(env, tracks, nowMs) {
     song_cursor: 0,
     current_song_post_id: first.id,
     current_voice_id: null,
+    current_ad_name: null,
   };
   await env.D1.prepare(
-    `INSERT INTO radio_state (id, segment_type, segment_start_ms, segment_duration_seconds, order_seed, order_length, song_cursor, current_song_post_id, current_voice_id)
-     VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?)
+    `INSERT INTO radio_state (id, segment_type, segment_start_ms, segment_duration_seconds, order_seed, order_length, song_cursor, current_song_post_id, current_voice_id, current_ad_name)
+     VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?)
      ON CONFLICT(id) DO UPDATE SET segment_type=excluded.segment_type, segment_start_ms=excluded.segment_start_ms,
        segment_duration_seconds=excluded.segment_duration_seconds, order_seed=excluded.order_seed, order_length=excluded.order_length,
-       song_cursor=excluded.song_cursor, current_song_post_id=excluded.current_song_post_id, current_voice_id=excluded.current_voice_id`
-  ).bind(state.segment_type, state.segment_start_ms, state.segment_duration_seconds, state.order_seed, state.order_length, state.song_cursor, state.current_song_post_id, state.current_voice_id).run();
+       song_cursor=excluded.song_cursor, current_song_post_id=excluded.current_song_post_id, current_voice_id=excluded.current_voice_id,
+       current_ad_name=excluded.current_ad_name`
+  ).bind(state.segment_type, state.segment_start_ms, state.segment_duration_seconds, state.order_seed, state.order_length, state.song_cursor, state.current_song_post_id, state.current_voice_id, state.current_ad_name).run();
   return state;
 }
 
@@ -3054,8 +3070,13 @@ async function advanceRadioSegment(env, tracks, state, segEndMs) {
         song_cursor: state.song_cursor,
         current_song_post_id: state.current_song_post_id,
         current_voice_id: voice.id,
+        current_ad_name: null,
       };
     }
+    // هیچ ویسی تو صف نبود؛ یعنی آهنگ مستقیم به آهنگِ بعدی می‌ره — دقیقاً همون لحظه‌ای که پیامِ
+    // بازرگانی پخش می‌شه (نه بعدِ ویس/مکث، چون اون چرخه پایین جدا مدیریت می‌شه و بدونِ آد می‌ره)
+    const ad = nextAdSegment(state, segEndMs);
+    if (ad) return ad;
     return nextSongSegment(tracks, state, segEndMs);
   }
   if (state.segment_type === "voice") {
@@ -3073,10 +3094,34 @@ async function advanceRadioSegment(env, tracks, state, segEndMs) {
       song_cursor: state.song_cursor,
       current_song_post_id: state.current_song_post_id,
       current_voice_id: null,
+      current_ad_name: null,
     };
   }
-  // pause -> آهنگِ بعدی
+  if (state.segment_type === "ad") {
+    // بعدِ پیامِ بازرگانی همیشه مستقیم می‌ره سراغِ آهنگِ بعدی (جینگل رو کلاینت خودش قبلِ شروعِ آهنگ پخش می‌کنه)
+    return nextSongSegment(tracks, state, segEndMs);
+  }
+  // pause -> آهنگِ بعدی (چرخه‌ی song → voice → pause → song؛ اینجا عمداً آدی درکار نیست)
   return nextSongSegment(tracks, state, segEndMs);
+}
+
+// انتخابِ یه پیامِ بازرگانیِ تصادفی از رویِ لیستِ ثابتِ سرور (نه کلاینت) تا طول/محتواش برایِ همه‌ی
+// کاربرا یکی باشه. اگه لیست خالی بود (یا کسی هنوز چیزی تنظیم نکرده)، null برمی‌گردونه تا رفتارِ قدیمی
+// (بدونِ آد، مستقیم آهنگِ بعدی) حفظ بشه.
+function nextAdSegment(state, segEndMs) {
+  if (!RADIO_ADS.length) return null;
+  const pick = RADIO_ADS[Math.floor(Math.random() * RADIO_ADS.length)];
+  return {
+    segment_type: "ad",
+    segment_start_ms: segEndMs,
+    segment_duration_seconds: pick.durationSeconds,
+    order_seed: state.order_seed,
+    order_length: state.order_length,
+    song_cursor: state.song_cursor,
+    current_song_post_id: state.current_song_post_id,
+    current_voice_id: null,
+    current_ad_name: pick.name,
+  };
 }
 
 // آهنگِ بعدیِ چیدمان رو برمی‌گردونه (بدونِ هیچ فچِ دیتابیسی؛ فقط رویِ آرایه‌ی tracksِ همین درخواست کار می‌کنه)
@@ -3101,6 +3146,7 @@ function nextSongSegment(tracks, state, segEndMs) {
     song_cursor: nextCursor,
     current_song_post_id: next.id,
     current_voice_id: null,
+    current_ad_name: null,
   };
 }
 
@@ -3139,6 +3185,7 @@ function fastForwardSongOnly(tracks, state, targetMs) {
     song_cursor: cursor,
     current_song_post_id: finalTrack.id,
     current_voice_id: null,
+    current_ad_name: null,
   };
 }
 
@@ -3147,12 +3194,12 @@ async function persistRadioState(env, prevStartMs, state) {
   // نبرده باشه (segment_start_ms هنوز همونیه که خوندیم) آپدیت می‌کنیم. اگه یه درخواستِ هم‌زمانِ
   // دیگه زودتر برده باشدش، همین یه‌بار می‌بازیم — بدونِ فاجعه، دفعه‌ی بعد state تازه رو می‌خونیم.
   const res = await env.D1.prepare(
-    `UPDATE radio_state SET segment_type=?, segment_start_ms=?, segment_duration_seconds=?, order_seed=?, order_length=?, song_cursor=?, current_song_post_id=?, current_voice_id=?
+    `UPDATE radio_state SET segment_type=?, segment_start_ms=?, segment_duration_seconds=?, order_seed=?, order_length=?, song_cursor=?, current_song_post_id=?, current_voice_id=?, current_ad_name=?
      WHERE id = 1 AND segment_start_ms = ?`
   )
     .bind(
       state.segment_type, state.segment_start_ms, state.segment_duration_seconds, state.order_seed,
-      state.order_length, state.song_cursor, state.current_song_post_id, state.current_voice_id, prevStartMs
+      state.order_length, state.song_cursor, state.current_song_post_id, state.current_voice_id, state.current_ad_name, prevStartMs
     )
     .run();
   return !!(res.meta && res.meta.changes > 0);
@@ -3243,6 +3290,15 @@ async function handleRadioNow(request, env) {
       durationSeconds: state.segment_duration_seconds,
       remainingSeconds: Math.ceil(remainingSeconds),
     };
+  } else if (state.segment_type === "ad") {
+    current = {
+      segmentType: "ad",
+      adName: state.current_ad_name,
+      startMs: state.segment_start_ms,
+      offsetSeconds: Math.floor(offsetInSegment),
+      durationSeconds: state.segment_duration_seconds,
+      remainingSeconds: Math.ceil(remainingSeconds),
+    };
   } else {
     const song = tracks.find((t) => t.id === state.current_song_post_id) || tracks[0];
     const senderProfile = await env.D1.prepare("SELECT avatar_file_id FROM profiles WHERE username = ?").bind(song.username).first();
@@ -3269,11 +3325,19 @@ async function handleRadioNow(request, env) {
     const pendingVoice = await pickPendingVoice(env);
     if (pendingVoice) {
       next = { type: "voice" };
+    } else if (RADIO_ADS.length) {
+      // بدونِ ویسِ در صف، طبقِ همون قاعده‌ی advanceRadioSegment، قسمتِ بعدی قطعاً پیامِ بازرگانیه
+      next = { type: "ad" };
     } else {
       const peek = nextSongSegment(tracks, state, 0);
       const nextSong = tracks.find((t) => t.id === peek.current_song_post_id);
       next = { type: "song", title: (nextSong && nextSong.audio_title) || "بدون‌نام", performer: (nextSong && nextSong.audio_performer) || "" };
     }
+  } else if (state.segment_type === "ad") {
+    // بعدِ پیامِ بازرگانی همیشه مستقیم آهنگِ بعدیه
+    const peek = nextSongSegment(tracks, state, 0);
+    const nextSong = tracks.find((t) => t.id === peek.current_song_post_id);
+    next = { type: "song", title: (nextSong && nextSong.audio_title) || "بدون‌نام", performer: (nextSong && nextSong.audio_performer) || "" };
   }
 
   const pendingCountRow = await env.D1.prepare("SELECT COUNT(*) AS cnt FROM radio_voice_queue WHERE status = 'pending'").first();
