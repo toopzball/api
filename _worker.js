@@ -1984,7 +1984,8 @@ async function getSimilarGamesFromIGDB(gameName, env) {
 async function getRelatedGameTracks(env, game, excludePostId) {
   try {
     const res = await env.D1.prepare(
-      `SELECT posts.id, posts.title, posts.audio_title, posts.audio_performer, posts.audio_thumb, posts.file_id, posts.username
+      `SELECT posts.id, posts.title, posts.audio_title, posts.audio_performer, posts.audio_thumb,
+              posts.audio_visual_feel, posts.audio_visual_feel_animated, posts.file_id, posts.username
        FROM post_music_info
        JOIN posts ON posts.id = post_music_info.post_id
        WHERE LOWER(post_music_info.game) = LOWER(?) AND post_music_info.post_id != ? AND posts.type = 'audio'
@@ -2235,7 +2236,8 @@ const MUSIC_HOME_SECTIONS = {
 // دیگه باید بشه صفحه‌بندی کرد، نه فقط ۱۲ تای اول.
 async function fetchAudioCandidatePool(env, limit) {
   const poolRes = await env.D1.prepare(
-    `SELECT id, username, title, audio_title, audio_performer, audio_thumb, audio_feeling, file_id,
+    `SELECT id, username, title, audio_title, audio_performer, audio_thumb, audio_feeling,
+            audio_visual_feel, audio_visual_feel_animated, file_id,
             message_id, bot_slot, date, upvotes, downvotes, likes, tags, duration_seconds, type
      FROM posts WHERE type = 'audio' ORDER BY date DESC LIMIT ?`
   ).bind(limit).all();
