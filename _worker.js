@@ -2235,12 +2235,21 @@ const MUSIC_HOME_SECTIONS = {
 // استخرِ نامزدها: آهنگ‌های اخیر/پرطرفدار. limit رو صفحه‌ی «دیدن بیشتر» بزرگ‌تر می‌فرسته چون اونجا
 // دیگه باید بشه صفحه‌بندی کرد، نه فقط ۱۲ تای اول.
 async function fetchAudioCandidatePool(env, limit) {
-  const poolRes = await env.D1.prepare(
-    `SELECT id, username, title, audio_title, audio_performer, audio_thumb, audio_feeling,
-            audio_visual_feel, audio_visual_feel_animated, file_id,
-            message_id, bot_slot, date, upvotes, downvotes, likes, tags, duration_seconds, type
-     FROM posts WHERE type = 'audio' ORDER BY date DESC LIMIT ?`
-  ).bind(limit).all();
+  const base = `id, username, title, audio_title, audio_performer, audio_thumb, audio_feeling, file_id,
+            message_id, bot_slot, date, upvotes, downvotes, likes, tags, duration_seconds, type`;
+  let poolRes;
+  try {
+    poolRes = await env.D1.prepare(
+      `SELECT ${base}, audio_visual_feel, audio_visual_feel_animated
+       FROM posts WHERE type = 'audio' ORDER BY date DESC LIMIT ?`
+    ).bind(limit).all();
+  } catch (e) {
+    // اگه ستون‌های حسِ تصویری هنوز تویِ D1 مایگریت نشده باشن، کوئری نباید کلِ فید رو بندازه
+    console.error("fetchAudioCandidatePool: fallback without visual feel columns", e && e.message);
+    poolRes = await env.D1.prepare(
+      `SELECT ${base} FROM posts WHERE type = 'audio' ORDER BY date DESC LIMIT ?`
+    ).bind(limit).all();
+  }
   return poolRes.results || [];
 }
 
