@@ -10908,6 +10908,24 @@ export default {
       await run("feed_page", async () => { const f = await fetchFeedPage(env, "", { page: 1, pageSize: 1, filter: "media", sort: "date" }); return Object.keys(f || {}); });
       await run("changelog", async () => { const c = await getCurrentChangelog(env); return c && c.version; });
       await run("audio_pool", async () => (await fetchAudioCandidatePool(env, 1)).length);
+      await run("cors_for_app_origin", async () => {
+        const h = corsHeadersFor(new Request(url.origin + "/api/bootstrap", { headers: { Origin: "https://appassets.androidplatform.net" } }));
+        return h["Access-Control-Allow-Origin"] || h["access-control-allow-origin"] || "MISSING";
+      });
+      await run("bootstrap_as_real_user", async () => {
+        const row = await env.D1.prepare("SELECT token FROM sessions WHERE expires_at > ? ORDER BY expires_at DESC LIMIT 1").bind(Date.now()).first();
+        if (!row) return "no active session";
+        const req = new Request(url.origin + "/api/bootstrap", { headers: { Authorization: "Bearer " + row.token } });
+        const res = await handleBootstrap(req, env);
+        const txt = await res.text();
+        return { status: res.status, bytes: txt.length, head: res.ok ? undefined : txt.slice(0, 200) };
+      });
+      await run("feed_as_real_user", async () => {
+        const u = await env.D1.prepare("SELECT username FROM sessions WHERE expires_at > ? ORDER BY expires_at DESC LIMIT 1").bind(Date.now()).first();
+        if (!u) return "no active session";
+        const f = await fetchFeedPage(env, u.username, { page: 1, pageSize: 5, filter: "media", sort: "date" });
+        return { posts: (f.posts || []).length };
+      });
       return json(out);
     }
     // ===== پایانِ تشخیصیِ موقت =====
