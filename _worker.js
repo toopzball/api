@@ -1027,6 +1027,21 @@ async function getUserFromToken(request, env) {
   }
   if (row.banned) return null;
 
+  // تمدیدِ خودکارِ نشست (sliding): کاربرِ فعال هیچ‌وقت ناگهان خارج نمی‌شه. برای اینکه برایِ هر
+  // درخواست یه نوشتن به D1 نزنیم، فقط وقتی تمدید می‌کنیم که بیش از یه روز از آخرین تمدید گذشته باشه
+  // (یعنی عمرِ باقی‌مونده کمتر از ۲۹ روز شده).
+  const SESSION_TTL_MS = 30 * 24 * 60 * 60 * 1000;
+  const RENEW_AFTER_MS = 24 * 60 * 60 * 1000;
+  if (row.expires_at - Date.now() < SESSION_TTL_MS - RENEW_AFTER_MS) {
+    try {
+      await env.D1.prepare("UPDATE sessions SET expires_at = ? WHERE token = ?")
+        .bind(Date.now() + SESSION_TTL_MS, token)
+        .run();
+    } catch (e) {
+      // شکستِ تمدید نباید لاگینِ کاربر رو خراب کنه
+    }
+  }
+
   return row.username;
 }
 
@@ -10891,44 +10906,6 @@ export default {
     if (request.method === "OPTIONS") {
       return new Response(null, { headers: corsHeaders });
     }
-
-    // ===== تشخیصیِ موقت (بعد از پیدا کردنِ مشکل حتماً پاکش کن) =====
-    if (url.pathname === "/api/_diag" && request.method === "GET") {
-      const out = { hasInternalKey: !!env.INTERNAL_KEY, tests: {} };
-      const run = async (name, fn) => {
-        const t0 = Date.now();
-        try { const r = await fn(); out.tests[name] = { ok: true, ms: Date.now() - t0, info: r === undefined ? null : r }; }
-        catch (e) { out.tests[name] = { ok: false, ms: Date.now() - t0, error: String((e && e.message) || e).slice(0, 300) }; }
-      };
-      await run("d1_select1", async () => (await env.D1.prepare("SELECT 1 AS x").first()).x);
-      await run("d1_posts_count", async () => (await env.D1.prepare("SELECT COUNT(*) AS c FROM posts").first()).c);
-      await run("d1_sessions_join", async () => (await env.D1.prepare("SELECT COUNT(*) AS c FROM sessions JOIN users ON users.username = sessions.username").first()).c);
-      await run("d1_profiles", async () => (await env.D1.prepare("SELECT COUNT(*) AS c FROM profiles").first()).c);
-      await run("d1_notifications", async () => (await env.D1.prepare("SELECT COUNT(*) AS c FROM notifications").first()).c);
-      await run("feed_page", async () => { const f = await fetchFeedPage(env, "", { page: 1, pageSize: 1, filter: "media", sort: "date" }); return Object.keys(f || {}); });
-      await run("changelog", async () => { const c = await getCurrentChangelog(env); return c && c.version; });
-      await run("audio_pool", async () => (await fetchAudioCandidatePool(env, 1)).length);
-      await run("cors_for_app_origin", async () => {
-        const h = corsHeadersFor(new Request(url.origin + "/api/bootstrap", { headers: { Origin: "https://appassets.androidplatform.net" } }));
-        return h["Access-Control-Allow-Origin"] || h["access-control-allow-origin"] || "MISSING";
-      });
-      await run("bootstrap_as_real_user", async () => {
-        const row = await env.D1.prepare("SELECT token FROM sessions WHERE expires_at > ? ORDER BY expires_at DESC LIMIT 1").bind(Date.now()).first();
-        if (!row) return "no active session";
-        const req = new Request(url.origin + "/api/bootstrap", { headers: { Authorization: "Bearer " + row.token } });
-        const res = await handleBootstrap(req, env);
-        const txt = await res.text();
-        return { status: res.status, bytes: txt.length, head: res.ok ? undefined : txt.slice(0, 200) };
-      });
-      await run("feed_as_real_user", async () => {
-        const u = await env.D1.prepare("SELECT username FROM sessions WHERE expires_at > ? ORDER BY expires_at DESC LIMIT 1").bind(Date.now()).first();
-        if (!u) return "no active session";
-        const f = await fetchFeedPage(env, u.username, { page: 1, pageSize: 5, filter: "media", sort: "date" });
-        return { posts: (f.posts || []).length };
-      });
-      return json(out);
-    }
-    // ===== پایانِ تشخیصیِ موقت =====
 
     // این ورکر دیگه نباید مستقیم صدا زده بشه؛ فقط از طریق ورکر پروکسیِ جلوش. پروکسی یه هدر
     // مخفی مشترک (X-Internal-Key) اضافه می‌کنه که فقط بین دو ورکر شناخته‌شده‌ست. یه استثنا هم
